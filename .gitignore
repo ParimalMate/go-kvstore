@@ -1,0 +1,21 @@
+
+# Binaries
+kvstore
+kvserver
+*.out
+
+# WAL and local data
+*.log
+*.wal
+test-data/
+data/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+#extra
+kvlog
