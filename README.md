@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Persistent Key-Value Store in Go
 
 A simple single-node key-value store built in Go. It exposes an HTTP API
@@ -407,5 +406,4 @@ Understanding these boundaries---especially what the system can and
 cannot promise when failures occur---is the foundation for the
 distributed milestone.
 =======
-# go-kvstore
->>>>>>> ca229489351fe70fc9be786b132ebc85a2976954
+
