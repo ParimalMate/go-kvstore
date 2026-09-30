@@ -1,4 +1,4 @@
-package main
+package store
 
 import (
 	"fmt"
@@ -174,5 +174,83 @@ func TestUnhealthyStore(t *testing.T) {
 	_, _, err := store.Get("name")
 	if err == nil {
 		t.Fatal("Expected Get to fail on unhealthy store")
+	}
+}
+
+func TestGetMissingKey(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "missing.log")
+	s := NewStore(filePath)
+	defer s.Close()
+
+	_, exists, err := s.Get("unknown")
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if exists {
+		t.Fatal("Expected missing key to not exist")
+	}
+}
+
+func TestPutOverwrite(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "overwrite.log")
+	s := NewStore(filePath)
+	defer s.Close()
+
+	if err := s.Put("name", "Parimal"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put("name", "Mate"); err != nil {
+		t.Fatal(err)
+	}
+
+	value, exists, err := s.Get("name")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists || value != "Mate" {
+		t.Fatalf("Expected Mate, got %q, exists=%v", value, exists)
+	}
+}
+
+func TestSpecialValues(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "special.log")
+	s := NewStore(filePath)
+
+	testCases := []struct {
+		key   string
+		value string
+	}{
+		{"spaces", "hello world with spaces"},
+		{"empty", ""},
+		{"newline", "first line\nsecond line"},
+		{"unicode", "नमस्ते 世界 🌍"},
+	}
+
+	for _, tc := range testCases {
+		if err := s.Put(tc.key, tc.value); err != nil {
+			t.Fatalf("Put failed for key %q: %v", tc.key, err)
+		}
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen the WAL to verify special values survive recovery.
+	recovered := NewStore(filePath)
+	defer recovered.Close()
+
+	for _, tc := range testCases {
+		got, exists, err := recovered.Get(tc.key)
+		if err != nil {
+			t.Fatalf("Get failed for key %q: %v", tc.key, err)
+		}
+		if !exists {
+			t.Errorf("Expected key %q to exist", tc.key)
+			continue
+		}
+		if got != tc.value {
+			t.Errorf("For key %q, expected %q, got %q", tc.key, tc.value, got)
+		}
 	}
 }

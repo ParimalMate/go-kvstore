@@ -41,11 +41,12 @@ pass() {
 }
 
 start_server() {
-    local port="$1"
-    local wal="$2"
-    local log="$3"
+    local id="$1"
+    local port="$2"
+    local wal="$3"
+    local log="$4"
 
-    "$BIN" -port "$port" -data "$wal" >"$log" 2>&1 &
+    "$BIN" --id "$id" --port "$port" --data "$wal" >"$log" 2>&1 &
     SERVER_PID=$!
 }
 
@@ -92,16 +93,16 @@ server_is_unreachable() {
 }
 
 echo "Building KV store..."
-go build -o "$BIN" . || fail "Go build failed"
+go build -o "$BIN" ./cmd/server || fail "Go build failed"
 
 echo
 echo "Starting Server A on port $PORT_A..."
-start_server "$PORT_A" "$TMP_DIR/store-a.log" "$TMP_DIR/server-a.log"
+start_server "n1" "$PORT_A" "$TMP_DIR/store-a.log" "$TMP_DIR/server-a.log"
 PID_A="$SERVER_PID"
 wait_for_server "$PORT_A" || fail "Server A did not start"
 
 echo "Starting Server B on port $PORT_B..."
-start_server "$PORT_B" "$TMP_DIR/store-b.log" "$TMP_DIR/server-b.log"
+start_server "n2" "$PORT_B" "$TMP_DIR/store-b.log" "$TMP_DIR/server-b.log"
 PID_B="$SERVER_PID"
 wait_for_server "$PORT_B" || fail "Server B did not start"
 
@@ -135,7 +136,7 @@ if ! server_is_unreachable "$PORT_A"; then
     fail "Server A is still responding after shutdown"
 fi
 
-start_server "$PORT_A" "$TMP_DIR/store-a.log" "$TMP_DIR/server-a.log"
+start_server "n1" "$PORT_A" "$TMP_DIR/store-a.log" "$TMP_DIR/server-a.log"
 PID_A="$SERVER_PID"
 wait_for_server "$PORT_A" || fail "Server A did not restart"
 
