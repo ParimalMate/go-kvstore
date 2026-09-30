@@ -4,17 +4,16 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"fmt"
+	"kvstore/internal/api"
+	"kvstore/internal/store"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
-
-	"kvstore/internal/api"
-	"kvstore/internal/store"
 )
 
 func main() {
@@ -23,6 +22,10 @@ func main() {
 	id := flag.String("id", "n1", "unique node ID")
 	peers := flag.String("peers", "", "comma-separated peer addresses")
 	flag.Parse()
+
+	if strings.TrimSpace(*id) == "" {
+		log.Fatal("node ID cannot be empty")
+	}
 
 	logger := log.New(
 		os.Stdout,
@@ -40,14 +43,26 @@ func main() {
 		}
 	}
 
-	selfAddr := fmt.Sprintf("localhost:%s", *port)
+	selfPort := *port
+
 	for _, peer := range peerList {
-		if peer == selfAddr {
-			logger.Fatalf(
-				"node %s cannot list itself as a peer: %s",
-				*id,
-				peer,
-			)
+		host, peerPort, err := net.SplitHostPort(peer)
+		if err != nil {
+			logger.Fatalf("invalid peer address %q: %v", peer, err)
+		}
+
+		if peerPort != selfPort {
+			continue
+		}
+
+		ip := net.ParseIP(host)
+
+		isLocalhost := host == "localhost" || host == ""
+		isLoopback := ip != nil && ip.IsLoopback()
+		isWildcard := ip != nil && ip.IsUnspecified()
+
+		if isLocalhost || isLoopback || isWildcard {
+			logger.Fatalf("node cannot be its own peer: %q", peer)
 		}
 	}
 

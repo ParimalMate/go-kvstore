@@ -23,7 +23,7 @@ func NewHandler(s *store.Store, logger *log.Logger) *Handler {
 
 func (h *Handler) GetHandler(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
-	h.logger.Printf("GET key=%s", key)
+	h.logger.Printf("GET key=%q", key)
 
 	value, exists, err := h.store.Get(key)
 	if err != nil {
@@ -41,7 +41,7 @@ func (h *Handler) GetHandler(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) PutHandler(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
-	h.logger.Printf("PUT key=%s", key)
+	h.logger.Printf("PUT key=%q", key)
 
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 
