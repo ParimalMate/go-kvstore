@@ -392,6 +392,26 @@ The current two-server checkpoint only proves that two independent
 processes can run at once. It does **not** establish distributed storage
 or replication.
 
+## Replication Semantics
+
+Writes are applied to the receiving node locally before replication is
+attempted. The local write is appended to the WAL and synced before the
+node forwards the value to its configured peers.
+
+Milestone 2 requires replication to all configured peers. If any peer
+cannot accept the write, the client receives a non-2xx response describing
+which peers succeeded and which failed.
+
+A replication failure does not roll back successful writes. The receiving
+node and any peers that successfully processed the request retain the
+value. Therefore, a partial replication failure can temporarily leave
+nodes with different state.
+
+A node that was unavailable during a write does not automatically receive
+the missed value when it restarts. Repairing this temporary inconsistency
+is outside Milestone 2 and will be handled by later anti-entropy
+functionality.
+
 ## Learning note
 
 The central Milestone 1 idea is the relationship between memory and

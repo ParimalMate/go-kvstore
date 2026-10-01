@@ -69,11 +69,12 @@ func main() {
 	kvStore := store.NewStore(*dataFile)
 	defer kvStore.Close()
 
-	handlers := api.NewHandler(kvStore, logger)
+	handlers := api.NewHandler(kvStore, logger, peerList)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /kv/{key}", handlers.GetHandler)
 	mux.HandleFunc("PUT /kv/{key}", handlers.PutHandler)
+	mux.HandleFunc("PUT /internal/kv/{key}", handlers.InternalPutHandler)
 
 	server := &http.Server{
 		Addr:    ":" + *port,
