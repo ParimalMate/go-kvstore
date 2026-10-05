@@ -21,6 +21,8 @@ func main() {
 	dataFile := flag.String("data", "kvlog", "WAL file path")
 	id := flag.String("id", "n1", "unique node ID")
 	peers := flag.String("peers", "", "comma-separated peer addresses")
+	w := flag.Int("w", 2, "write quorum size, including the local node")
+	r := flag.Int("r", 2, "read quorum size, including the local node")
 	flag.Parse()
 
 	if strings.TrimSpace(*id) == "" {
@@ -66,14 +68,23 @@ func main() {
 		}
 	}
 
+	n := len(peerList) + 1
+	if *w < 1 || *w > n || *r < 1 || *r > n {
+		logger.Fatalf("invalid quorum configuration: W=%d R=%d N=%d; W and R must each be between 1 and N", *w, *r, n)
+	}
+	if *w+*r <= n {
+		logger.Fatalf("invalid quorum configuration: W=%d R=%d N=%d; W+R must be greater than N", *w, *r, n)
+	}
+
 	kvStore := store.NewStore(*dataFile)
 	defer kvStore.Close()
 
-	handlers := api.NewHandler(kvStore, logger, peerList)
+	handlers := api.NewHandler(kvStore, logger, peerList, *w, *r)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /kv/{key}", handlers.GetHandler)
 	mux.HandleFunc("PUT /kv/{key}", handlers.PutHandler)
+	mux.HandleFunc("GET /internal/kv/{key}", handlers.InternalGetHandler)
 	mux.HandleFunc("PUT /internal/kv/{key}", handlers.InternalPutHandler)
 
 	server := &http.Server{

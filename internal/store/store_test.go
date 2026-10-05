@@ -254,3 +254,114 @@ func TestSpecialValues(t *testing.T) {
 		}
 	}
 }
+
+func TestPutAtMetadataRecovery(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "metadata.log")
+	s := NewStore(path)
+	const timestamp int64 = 1720000000000000123
+
+	if err := s.PutAt("name", "old", timestamp-1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutAt("name", "Parimal", timestamp); err != nil {
+		t.Fatal(err)
+	}
+
+	check := func(s *Store) {
+		t.Helper()
+		value, ts, exists, err := s.GetWithMeta("name")
+		if err != nil || !exists || value != "Parimal" || ts != timestamp {
+			t.Fatalf("unexpected metadata: value=%q ts=%d exists=%v err=%v", value, ts, exists, err)
+		}
+		value, exists, err = s.Get("name")
+		if err != nil || !exists || value != "Parimal" {
+			t.Fatalf("Get wrapper: value=%q exists=%v err=%v", value, exists, err)
+		}
+	}
+	check(s)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recovered := NewStore(path)
+	defer recovered.Close()
+	check(recovered)
+}
+
+func TestLegacyWALTimestamp(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.log")
+	legacy := []byte("{\"op\":\"PUT\",\"key\":\"name\",\"value\":\"Parimal\"}\n")
+	if err := os.WriteFile(path, legacy, 0644); err != nil {
+		t.Fatal(err)
+	}
+	s := NewStore(path)
+	defer s.Close()
+	value, ts, exists, err := s.GetWithMeta("name")
+	if err != nil || !exists || value != "Parimal" || ts != 0 {
+		t.Fatalf("legacy metadata: value=%q ts=%d exists=%v err=%v", value, ts, exists, err)
+	}
+}
+
+func TestMetadataReadStates(t *testing.T) {
+	s := NewStore(filepath.Join(t.TempDir(), "states.log"))
+	defer s.Close()
+
+	value, ts, exists, err := s.GetWithMeta("missing")
+	if err != nil || exists || value != "" || ts != 0 {
+		t.Fatalf("missing key: value=%q ts=%d exists=%v err=%v", value, ts, exists, err)
+	}
+	if err := s.Put("empty", ""); err != nil {
+		t.Fatal(err)
+	}
+	value, ts, exists, err = s.GetWithMeta("empty")
+	if err != nil || !exists || value != "" || ts <= 0 {
+		t.Fatalf("Put wrapper: value=%q ts=%d exists=%v err=%v", value, ts, exists, err)
+	}
+
+	s.mu.Lock()
+	s.failed = true
+	s.mu.Unlock()
+	if err := s.PutAt("empty", "changed", 123); err == nil {
+		t.Fatal("PutAt must reject writes while unhealthy")
+	}
+	if _, _, _, err := s.GetWithMeta("empty"); err == nil {
+		t.Fatal("GetWithMeta must reject reads while unhealthy")
+	}
+}
+
+func TestOlderWriteDoesNotReplaceNewer(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal")
+	s := NewStore(path)
+	for _, version := range []struct {
+		value string
+		ts    int64
+	}{{"fresh", 200}, {"stale", 100}} {
+		if err := s.PutAt("key", version.value, version.ts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(s *Store) {
+		t.Helper()
+		value, ts, exists, err := s.GetWithMeta("key")
+		if err != nil || !exists || value != "fresh" || ts != 200 {
+			t.Fatalf("got %q %d %t %v", value, ts, exists, err)
+		}
+	}
+	check(s)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate an older WAL produced before timestamp-aware replay existed.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("{\"op\":\"PUT\",\"key\":\"key\",\"value\":\"stale\",\"ts\":100}\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recovered := NewStore(path)
+	defer recovered.Close()
+	check(recovered)
+}

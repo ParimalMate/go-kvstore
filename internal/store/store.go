@@ -8,10 +8,16 @@ import (
 	"io"
 	"os"
 	"sync"
+	"time"
 )
 
+type entry struct {
+	Value string
+	Ts    int64
+}
+
 type Store struct {
-	data   map[string]string
+	data   map[string]entry
 	mu     sync.Mutex
 	log    *os.File
 	failed bool
@@ -21,6 +27,7 @@ type record struct {
 	Op    string `json:"op"`
 	Key   string `json:"key"`
 	Value string `json:"value"`
+	Ts    int64  `json:"ts"`
 }
 
 func NewStore(filePath string) *Store {
@@ -33,7 +40,7 @@ func NewStore(filePath string) *Store {
 		panic(err)
 	}
 
-	data := make(map[string]string)
+	data := make(map[string]entry)
 
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
@@ -46,7 +53,10 @@ func NewStore(filePath string) *Store {
 		}
 
 		if rec.Op == "PUT" {
-			data[rec.Key] = rec.Value
+			current, exists := data[rec.Key]
+			if !exists || rec.Ts >= current.Ts {
+				data[rec.Key] = entry{Value: rec.Value, Ts: rec.Ts}
+			}
 		}
 	}
 
@@ -61,17 +71,26 @@ func NewStore(filePath string) *Store {
 }
 
 func (s *Store) Put(key string, value string) error {
+	return s.PutAt(key, value, time.Now().UnixNano())
+}
+
+// PutAt persists the supplied version unless a higher timestamp is already stored.
+func (s *Store) PutAt(key string, value string, ts int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.failed {
 		return errors.New("store is unhealthy, restart required")
 	}
+	if current, exists := s.data[key]; exists && ts < current.Ts {
+		return nil // A delayed older write must not replace a newer durable value.
+	}
 
 	rec := record{
 		Op:    "PUT",
 		Key:   key,
 		Value: value,
+		Ts:    ts,
 	}
 
 	encoded, err := json.Marshal(rec)
@@ -97,20 +116,26 @@ func (s *Store) Put(key string, value string) error {
 		return err
 	}
 
-	s.data[key] = value
+	s.data[key] = entry{Value: value, Ts: ts}
 	return nil
 }
 
 func (s *Store) Get(key string) (string, bool, error) {
+	value, _, exists, err := s.GetWithMeta(key)
+	return value, exists, err
+}
+
+// GetWithMeta returns the value and its timestamp from the same stored entry.
+func (s *Store) GetWithMeta(key string) (string, int64, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.failed {
-		return "", false, errors.New("store is unhealthy, restart required")
+		return "", 0, false, errors.New("store is unhealthy, restart required")
 	}
 
 	value, exists := s.data[key]
-	return value, exists, nil
+	return value.Value, value.Ts, exists, nil
 }
 
 func (s *Store) Close() error {

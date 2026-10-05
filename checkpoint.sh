@@ -45,7 +45,7 @@ start_server() {
     local wal="$3"
     local log="$4"
 
-    "$BIN" --id "$id" --port "$port" --data "$wal" >"$log" 2>&1 &
+    "$BIN" --id "$id" --port "$port" --data "$wal" --w 1 --r 1 >"$log" 2>&1 &
     SERVER_PID=$!
 }
 

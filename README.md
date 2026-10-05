@@ -394,13 +394,46 @@ or replication.
 
 ## Replication Semantics
 
+### Milestone 3 preparation: quorum configuration
+
+The server accepts `--w` and `--r` flags, both defaulting to `2`.
+`N` is the number of configured peers plus the local node. Startup rejects
+configurations unless `1 <= W <= N`, `1 <= R <= N`, and `W + R > N`.
+Validation happens before opening the WAL or starting the HTTP listener.
+
+For the three-node cluster, the defaults give `N=3, W=2, R=2`.
+For a standalone node without peers, explicitly pass `--w 1 --r 1`:
+
+```bash
+go run ./cmd/server --w 1 --r 1
+```
+
+Both values are now passed into the API handler. Writes use W to decide
+when to acknowledge success; reads collect R valid answers, including
+the local lookup, before selecting a value. The overlap condition guarantees that
+a read quorum and a successful write quorum share at least one replica
+when drawn from the same replica set; it does not by itself guarantee
+strong consistency or resolve concurrent writes.
+
 Writes are applied to the receiving node locally before replication is
 attempted. The local write is appended to the WAL and synced before the
 node forwards the value to its configured peers.
 
-Milestone 2 requires replication to all configured peers. If any peer
-cannot accept the write, the client receives a non-2xx response describing
-which peers succeeded and which failed.
+Milestone 2 required every configured peer to acknowledge. The first
+Milestone 3 increment now counts the durable local write as one ack,
+attempts every configured peer, and returns 200 as soon as W total acks
+are collected. With N=3 and W=2, one successful peer is enough even if the
+other peer is slow or unavailable. W=1 returns after local persistence
+while still attempting all peers.
+
+A background collector drains and logs every result, including results
+arriving after the HTTP response. A mutex protects its success/failure
+lists, and sync.Once closes a quorum notification channel exactly once.
+The handler waits for that notification or the independent two-second
+replication context. If all attempts finish without a quorum, it can fail
+earlier. Insufficient acks produce 503 with the same `replicated`/`failed`
+JSON fields as Milestone 2. At a deadline, this is a snapshot of results
+collected so far; still-pending peers may not yet appear in either list.
 
 A replication failure does not roll back successful writes. The receiving
 node and any peers that successfully processed the request retain the
@@ -411,6 +444,153 @@ A node that was unavailable during a write does not automatically receive
 the missed value when it restarts. Repairing this temporary inconsistency
 is outside Milestone 2 and will be handled by later anti-entropy
 functionality.
+
+### Milestone 3 preparation: timestamp storage
+
+The local store now retains a value and an `int64` timestamp per key.
+`PutAt(key, value, ts)` persists the supplied timestamp in memory
+and in the WAL unless a higher timestamp is already stored. Such an older
+write is acknowledged without replacing the newer durable version. `GetWithMeta` returns it alongside the value and existence
+flag. The existing `Put` generates a timestamp with `time.Now().UnixNano()`;
+`Get` returns only the value, existence flag, and error as before.
+Old WAL records without `ts` recover with timestamp zero.
+
+Live writes and WAL replay retain the higher timestamp, so delayed older
+writes cannot erase a newer version. Equal timestamps still use arrival
+order locally; quorum reads retain the first encountered value on a tie.
+Equal-timestamp conflicting values are an unresolved milestone limitation. For an external PUT, the coordinator now
+generates one timestamp and uses `PutAt` locally. It passes that same
+timestamp through `FanOut` and `Replicate` to every peer.
+
+Internal PUT now accepts JSON `{"value":"Parimal","ts":1720000000000000123}`
+and persists it using `PutAt`, without generating a new timestamp or
+forwarding again. Both fields are required and must be non-null; `ts` must
+be an `int64` integer. Empty values and timestamp zero are accepted.
+Malformed payloads return 400. External PUT still accepts the raw value.
+Both endpoints limit the decoded value to 1 MiB; internal PUT allows up to
+6 MiB plus 1024 bytes of JSON body to accommodate escaping and metadata.
+Oversized requests return 413. All running peers must use this JSON
+protocol; the internal endpoint no longer accepts the old raw body format.
+
+Physical-clock timestamps are a deliberate Milestone 3 simplification.
+They do not eliminate clock skew between coordinators, clock adjustments,
+or equal timestamps, and cannot reliably describe causal ordering.
+Milestone 4 is planned to introduce vector clocks to track causal order
+and identify concurrent versions; resolving those conflicts remains a
+separate policy decision.
+
+Concurrent writes from two coordinators use last-write-wins by timestamp:
+the higher timestamp wins without detecting a conflict, even when the two
+values represent independent updates. That information loss is a known
+Milestone 3 boundary; vector clocks in Milestone 4 will make concurrency
+detectable rather than silently treating both writes as an ordered pair.
+
+### Milestone 3 preparation: internal reads
+
+`GET /internal/kv/{key}` reads only the receiving node's store and returns
+HTTP 200 with JSON containing `value`, `ts`, and `exists`:
+
+```json
+{"value":"Parimal","ts":1720000000000000123,"exists":true}
+```
+
+A missing key is a successful lookup with HTTP 200 and
+`{"value":"","ts":0,"exists":false}`. An unhealthy store returns HTTP 500.
+This lets quorum reads distinguish a responding replica with no
+value from a failed lookup. The external `GET /kv/{key}` still returns
+plain text for an existing key and HTTP 404 when all R valid answers
+report absence. It returns 503 when fewer than R valid answers arrive.
+
+### Milestone 3: quorum reads
+
+External GET reads local metadata first. When R > 1, `ReadFanOut` queries
+all peers concurrently through the shared HTTP client and a two-second
+background context. Querying all peers allows another healthy peer to
+answer when one fails; the handler stops waiting after R valid answers
+including its local lookup. Missing keys count as answers; network errors,
+non-200 statuses, and malformed metadata do not. Among those R answers,
+the handler selects the highest timestamp that has `exists=true`.
+R=1 needs only the local lookup. An unhealthy local store returns 500.
+
+A buffered collector logs every attempted peer's outcome, latency, and
+reported timestamp, including attempts that finish after the response.
+The handler logs the quorum decision and selected timestamp. Reads do not
+repair stale replicas.
+
+For the same fixed set of N distinct replicas, W+R>N forces every
+R-replica read set to overlap every W-replica successful write set: there
+are only N-W replicas outside that write set, fewer than R. With versions
+retained by timestamp, the read therefore sees that write's timestamp or
+a higher one at an overlapping replica. This is a timestamp-order claim,
+not a guarantee of real-time ordering across skewed clocks. Reads may also
+observe writes whose clients received 503 after partial persistence.
+Configure each actual replica exactly once and use consistent membership
+on every node; address aliases are not a replica identity mechanism.
+
+### Milestone 3 preparation: independent replication lifetime
+
+After the local write succeeds, external PUT creates a two-second context
+from `context.Background()` and passes it to `replication.FanOut`. Its
+background result collector owns cancellation and releases the timer when
+collection finishes. The handler does not defer cancellation when it
+returns an early quorum response. Client cancellation therefore does not
+cancel the peer writes. `StartFanOut` remains an independently timed helper
+for callers that only need a results channel.
+
+The results channel has room for one result per peer. Replication remains
+in-process work, not a durable background queue: process exit stops any
+remaining attempts. Tracking outstanding replication during shutdown is
+not implemented in this increment.
+
+### Milestone 3 incremental validation
+
+The write-quorum tests cover a fast peer, a peer delayed by 900ms, and a
+failing peer. With W=2 they require the response before 700ms and verify
+that the delayed success is still logged afterward. Three simulated peers
+plus the coordinator means N=4 in that test; it uses R=3 to preserve
+W+R>N. Other tests cover W=1, insufficient acks, timeout snapshots, local
+write failure, and client cancellation. Read tests cover freshest-version
+selection, missing and empty values, malformed replies, failed peers,
+R=1, R=3, early responses, and deadlines. Store tests cover delayed older
+writes and out-of-order WAL replay. The final commit and milestone tag
+remain upcoming steps.
+
+### Repeatable real-cluster checks
+
+Run from the repository root (requires Go, Python 3, curl, and POSIX signals):
+
+```bash
+python3 scripts/check-quorum-cluster.py
+```
+
+The script builds a temporary binary and launches three real server
+processes with N=3, W=2, R=2, separate temporary WALs, and dynamically
+chosen loopback ports. It uses curl's `time_total` to time requests. It
+pauses only its own n3 process with SIGSTOP, resumes it with SIGCONT, then
+separately kills and restarts n3 to create a persistent replication gap.
+It cleans up its processes and temporary files, including on failure.
+
+Observed on 2026-10-06 (five PUTs per scenario):
+
+| Scenario | Successful PUTs | Median latency | Maximum latency |
+| --- | --- | --- | --- |
+| All nodes healthy | 5/5 | 8.270 ms | 8.371 ms |
+| n3 paused | 5/5 | 6.029 ms | 6.457 ms |
+| n3 killed | 5/5 | 5.828 ms | 7.641 ms |
+
+These small local samples demonstrate that the unavailable third node did
+not impose its two-second timeout on the client; the timing differences
+are normal variation, not evidence that failure improves performance.
+Milestone 2 required all peer successes and would return 503 for a failed
+peer. Milestone 3 can return 200 after the local write and one peer succeed.
+The historical Milestone 2 binary was not rerun for this measurement.
+
+For the stale-replica check, all nodes first stored `old`. While n3 was
+down, n1 and n2 stored `fresh` with the same higher timestamp. After n3
+restarted, internal GETs confirmed `[fresh, fresh, old]`. All 15 external
+quorum GETs (five per coordinator) returned `fresh`. Internal GET on n3
+still returned `old` afterward, confirming selection without read repair.
+The script also prints peer timestamps and selected-timestamp log examples.
 
 ## Learning note
 
@@ -425,5 +605,3 @@ durable storage:
 Understanding these boundaries---especially what the system can and
 cannot promise when failures occur---is the foundation for the
 distributed milestone.
-=======
-

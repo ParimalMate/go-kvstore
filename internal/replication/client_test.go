@@ -2,15 +2,19 @@ package replication
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
 func TestReplicateSuccess(t *testing.T) {
+	const ts int64 = 1720000000000000123
 	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
 			t.Errorf("expected PUT request, got %s", r.Method)
@@ -20,13 +24,18 @@ func TestReplicateSuccess(t *testing.T) {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
 
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("failed to read request body: %v", err)
+		if r.Header.Get("Content-Type") != "application/json" {
+			t.Error("expected JSON content type")
 		}
-
-		if string(body) != "hello" {
-			t.Errorf("expected body \"hello\", got %q", string(body))
+		var body struct {
+			Value string `json:"value"`
+			Ts    int64  `json:"ts"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("failed to decode request body: %v", err)
+		}
+		if body.Value != "hello" || body.Ts != ts {
+			t.Errorf("unexpected write payload: %+v", body)
 		}
 
 		w.WriteHeader(http.StatusOK)
@@ -40,6 +49,7 @@ func TestReplicateSuccess(t *testing.T) {
 		peerAddress,
 		"test-key",
 		"hello",
+		ts,
 	)
 
 	if err != nil {
@@ -68,6 +78,7 @@ func TestFanOutAllPeersSucceed(t *testing.T) {
 		peers,
 		"course",
 		"distributed-systems",
+		123,
 	)
 
 	successCount := 0
@@ -124,6 +135,7 @@ func TestFanOutReportsFailures(t *testing.T) {
 		peers,
 		"test-key",
 		"test-value",
+		123,
 	)
 
 	successCount := 0
@@ -156,5 +168,116 @@ func TestFanOutReportsFailures(t *testing.T) {
 
 	if failedPeers[successAddr] {
 		t.Errorf("successful peer %s was incorrectly reported as failed", successAddr)
+	}
+}
+
+func TestStartFanOutSurvivesHandlerReturn(t *testing.T) {
+	release := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		select {
+		case <-release:
+			w.WriteHeader(http.StatusOK)
+		case <-r.Context().Done():
+		}
+	}))
+	defer slow.Close()
+	defer unblock()
+	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer fast.Close()
+
+	remaining := make(chan (<-chan Result), 1)
+	requestContexts := make(chan context.Context, 1)
+	// This small test handler models a future quorum response after one peer ack.
+	coordinator := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		results := StartFanOut([]string{
+			strings.TrimPrefix(fast.URL, "http://"),
+			strings.TrimPrefix(slow.URL, "http://"),
+		}, "name", "Parimal", 123)
+		remaining <- results
+		requestContexts <- r.Context()
+		first := <-results
+		if first.Err != nil {
+			http.Error(w, first.Err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer coordinator.Close()
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(coordinator.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("early response status=%d", resp.StatusCode)
+	}
+	ctx := <-requestContexts
+	select {
+	case <-ctx.Done(): // The HTTP handler has returned and its context is cancelled.
+	case <-time.After(5 * time.Second):
+		t.Fatal("coordinator handler did not return")
+	}
+	unblock()
+	results := <-remaining
+	select {
+	case result, ok := <-results:
+		if !ok || result.Err != nil || result.Peer != strings.TrimPrefix(slow.URL, "http://") {
+			t.Fatalf("straggler failed after response: result=%+v open=%v", result, ok)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("straggler did not finish")
+	}
+	select {
+	case _, ok := <-results:
+		if ok {
+			t.Fatal("unexpected extra result")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("results channel did not close")
+	}
+}
+
+func TestStartFanOutTimeout(t *testing.T) {
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		<-r.Context().Done()
+	}))
+	defer peer.Close()
+	results := StartFanOut([]string{strings.TrimPrefix(peer.URL, "http://")}, "name", "Parimal", 123)
+	select {
+	case result, ok := <-results:
+		if !ok || !errors.Is(result.Err, context.DeadlineExceeded) {
+			t.Fatalf("expected deadline error, got result=%+v open=%v", result, ok)
+		}
+	case <-time.After(5 * time.Second):
+		peer.CloseClientConnections()
+		t.Fatal("independent replication did not time out")
+	}
+	select {
+	case _, ok := <-results:
+		if ok {
+			t.Fatal("unexpected extra result")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("results channel did not close after timeout")
+	}
+}
+
+func TestStartFanOutNoPeers(t *testing.T) {
+	select {
+	case _, ok := <-StartFanOut(nil, "name", "Parimal", 123):
+		if ok {
+			t.Fatal("unexpected result without peers")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("empty fan-out did not close")
 	}
 }
