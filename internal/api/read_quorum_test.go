@@ -3,6 +3,7 @@ package api
 import (
 	"io"
 	"kvstore/internal/store"
+	"kvstore/internal/vectorclock"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -21,22 +22,27 @@ func TestReadQuorum(t *testing.T) {
 		status int
 		value  string
 	}{
-		{"fresh peer", true, []string{`{"value":"fresh","ts":200,"exists":true}`}, 2, 200, "fresh"},
-		{"fresh local", true, []string{`{"value":"old","ts":50,"exists":true}`}, 2, 200, "local"},
-		{"local absent", false, []string{`{"value":"fresh","ts":200,"exists":true}`}, 2, 200, "fresh"},
-		{"all absent", false, []string{`{"value":"","ts":0,"exists":false}`}, 2, 404, ""},
-		{"empty value exists", false, []string{`{"value":"","ts":0,"exists":true}`}, 2, 200, ""},
+		{"fresh peer", true, []string{`[{"value":"fresh","vc":{"n1":4}}]`}, 2, 200, "fresh"},
+		{"fresh local", true, []string{`[{"value":"old","vc":{"n1":1}}]`}, 2, 200, "local"},
+		{"local absent", false, []string{`[{"value":"fresh","vc":{"n1":4}}]`}, 2, 200, "fresh"},
+		{"all absent", false, []string{`[]`}, 2, 404, ""},
+		{"empty value exists", false, []string{`[{"value":"","vc":{}}]`}, 2, 200, ""},
 		{"failure is not absence", false, []string{"FAIL"}, 2, 503, ""},
 		{"malformed is not an answer", true, []string{`{"value":"bad"}`}, 2, 503, ""},
-		{"other peer rescues failure", true, []string{"FAIL", `{"value":"fresh","ts":200,"exists":true}`}, 2, 200, "fresh"},
-		{"need all three", true, []string{`{"value":"middle","ts":150,"exists":true}`, `{"value":"fresh","ts":200,"exists":true}`}, 3, 200, "fresh"},
+		{"other peer rescues failure", true, []string{"FAIL", `[{"value":"fresh","vc":{"n1":4}}]`}, 2, 200, "fresh"},
+		{"need all three", true, []string{`[{"value":"middle","vc":{"n1":3}}]`, `[{"value":"fresh","vc":{"n1":4}}]`}, 3, 200, "fresh"},
 		{"R one", true, nil, 1, 200, "local"},
+		{"concurrent", true, []string{`[{"value":"independent","vc":{"n2":1}}]`}, 2, http.StatusMultipleChoices, ""},
+		{"same version", true, []string{`[{"value":"local","vc":{"n1":2}}]`}, 2, 200, "local"},
+		{"clock collision", true, []string{`[{"value":"different","vc":{"n1":2}}]`}, 2, 502, ""},
+		{"null not missing", false, []string{`null`}, 2, 503, ""},
+		{"one peer has siblings", false, []string{`[{"value":"A","vc":{"n1":1}},{"value":"B","vc":{"n2":1}}]`}, 2, http.StatusMultipleChoices, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := store.NewStore(filepath.Join(t.TempDir(), "wal"))
 			defer s.Close()
 			if tc.local {
-				if err := s.PutAt("name", "local", 100); err != nil {
+				if _, err := s.PutWithClock("name", "local", vectorclock.VectorClock{"n1": 2}); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -55,7 +61,7 @@ func TestReadQuorum(t *testing.T) {
 				defer server.Close()
 				peers = append(peers, strings.TrimPrefix(server.URL, "http://"))
 			}
-			h := NewHandler(s, log.New(io.Discard, "", 0), peers, len(peers)+1, tc.r)
+			h := NewHandler(s, log.New(io.Discard, "", 0), peers, len(peers)+1, tc.r, "n1")
 			mux := http.NewServeMux()
 			mux.HandleFunc("GET /kv/{key}", h.GetHandler)
 			response := httptest.NewRecorder()
@@ -80,13 +86,13 @@ func TestReadQuorumSlowPeer(t *testing.T) {
 			peers := []string{strings.TrimPrefix(slow.URL, "http://")}
 			if enough {
 				fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					io.WriteString(w, `{"value":"fresh","ts":200,"exists":true}`)
+					io.WriteString(w, `[{"value":"fresh","vc":{"n1":4}}]`)
 				}))
 				defer fast.Close()
 				peers = append(peers, strings.TrimPrefix(fast.URL, "http://"))
 			}
 			logs := make(quorumLog, 16)
-			h := NewHandler(s, log.New(logs, "", 0), peers, 2, 2)
+			h := NewHandler(s, log.New(logs, "", 0), peers, 2, 2, "n1")
 			req := httptest.NewRequest("GET", "/kv/name", nil)
 			req.SetPathValue("key", "name")
 			response := httptest.NewRecorder()

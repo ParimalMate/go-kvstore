@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"kvstore/internal/vectorclock"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,7 +16,7 @@ import (
 )
 
 func TestReplicateSuccess(t *testing.T) {
-	const ts int64 = 1720000000000000123
+	vc := vectorclock.VectorClock{"n1": 1720000000000000123, "n2": 2}
 	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
 			t.Errorf("expected PUT request, got %s", r.Method)
@@ -28,13 +30,13 @@ func TestReplicateSuccess(t *testing.T) {
 			t.Error("expected JSON content type")
 		}
 		var body struct {
-			Value string `json:"value"`
-			Ts    int64  `json:"ts"`
+			Value string                  `json:"value"`
+			VC    vectorclock.VectorClock `json:"vc"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Errorf("failed to decode request body: %v", err)
 		}
-		if body.Value != "hello" || body.Ts != ts {
+		if body.Value != "hello" || !maps.Equal(body.VC, vc) {
 			t.Errorf("unexpected write payload: %+v", body)
 		}
 
@@ -49,7 +51,7 @@ func TestReplicateSuccess(t *testing.T) {
 		peerAddress,
 		"test-key",
 		"hello",
-		ts,
+		vc,
 	)
 
 	if err != nil {
@@ -78,7 +80,7 @@ func TestFanOutAllPeersSucceed(t *testing.T) {
 		peers,
 		"course",
 		"distributed-systems",
-		123,
+		vectorclock.VectorClock{"n1": 123},
 	)
 
 	successCount := 0
@@ -135,7 +137,7 @@ func TestFanOutReportsFailures(t *testing.T) {
 		peers,
 		"test-key",
 		"test-value",
-		123,
+		vectorclock.VectorClock{"n1": 123},
 	)
 
 	successCount := 0
@@ -198,7 +200,7 @@ func TestStartFanOutSurvivesHandlerReturn(t *testing.T) {
 		results := StartFanOut([]string{
 			strings.TrimPrefix(fast.URL, "http://"),
 			strings.TrimPrefix(slow.URL, "http://"),
-		}, "name", "Parimal", 123)
+		}, "name", "Parimal", vectorclock.VectorClock{"n1": 123})
 		remaining <- results
 		requestContexts <- r.Context()
 		first := <-results
@@ -251,7 +253,7 @@ func TestStartFanOutTimeout(t *testing.T) {
 		<-r.Context().Done()
 	}))
 	defer peer.Close()
-	results := StartFanOut([]string{strings.TrimPrefix(peer.URL, "http://")}, "name", "Parimal", 123)
+	results := StartFanOut([]string{strings.TrimPrefix(peer.URL, "http://")}, "name", "Parimal", vectorclock.VectorClock{"n1": 123})
 	select {
 	case result, ok := <-results:
 		if !ok || !errors.Is(result.Err, context.DeadlineExceeded) {
@@ -273,7 +275,7 @@ func TestStartFanOutTimeout(t *testing.T) {
 
 func TestStartFanOutNoPeers(t *testing.T) {
 	select {
-	case _, ok := <-StartFanOut(nil, "name", "Parimal", 123):
+	case _, ok := <-StartFanOut(nil, "name", "Parimal", vectorclock.VectorClock{"n1": 123}):
 		if ok {
 			t.Fatal("unexpected result without peers")
 		}

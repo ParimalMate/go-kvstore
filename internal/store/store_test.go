@@ -2,8 +2,10 @@ package store
 
 import (
 	"fmt"
+	"kvstore/internal/vectorclock"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -13,7 +15,7 @@ func TestPutGet(t *testing.T) {
 	store := NewStore(filePath)
 	defer store.Close()
 
-	err := store.Put("name", "Parimal")
+	_, err := store.PutWithClock("name", "Parimal", vectorclock.VectorClock{"n1": 1})
 	if err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
@@ -36,7 +38,7 @@ func TestWALRecovery(t *testing.T) {
 
 	store := NewStore(filePath)
 
-	err := store.Put("name", "Parimal")
+	_, err := store.PutWithClock("name", "Parimal", vectorclock.VectorClock{"n1": 1})
 	if err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
@@ -80,7 +82,7 @@ func TestConcurrentAccess(t *testing.T) {
 			value := fmt.Sprintf("value-%d", i)
 
 			// Write to the store.
-			if err := store.Put(key, value); err != nil {
+			if _, err := store.PutWithClock(key, value, vectorclock.VectorClock{"n1": 1}); err != nil {
 				t.Errorf("Put failed: %v", err)
 				return
 			}
@@ -112,7 +114,7 @@ func TestWALTailRecovery(t *testing.T) {
 
 	store := NewStore(path)
 
-	if err := store.Put("a", "100"); err != nil {
+	if _, err := store.PutWithClock("a", "100", vectorclock.VectorClock{"n1": 1}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -166,7 +168,7 @@ func TestUnhealthyStore(t *testing.T) {
 	store.mu.Unlock()
 
 	// PUT should be rejected.
-	if err := store.Put("name", "Parimal"); err == nil {
+	if _, err := store.PutWithClock("name", "Parimal", vectorclock.VectorClock{"n1": 1}); err == nil {
 		t.Fatal("Expected Put to fail on unhealthy store")
 	}
 
@@ -196,10 +198,10 @@ func TestPutOverwrite(t *testing.T) {
 	s := NewStore(filePath)
 	defer s.Close()
 
-	if err := s.Put("name", "Parimal"); err != nil {
+	if _, err := s.PutWithClock("name", "Parimal", vectorclock.VectorClock{"n1": 1}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Put("name", "Mate"); err != nil {
+	if _, err := s.PutWithClock("name", "Mate", vectorclock.VectorClock{"n1": 2}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -227,7 +229,7 @@ func TestSpecialValues(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		if err := s.Put(tc.key, tc.value); err != nil {
+		if _, err := s.PutWithClock(tc.key, tc.value, vectorclock.VectorClock{"n1": 1}); err != nil {
 			t.Fatalf("Put failed for key %q: %v", tc.key, err)
 		}
 	}
@@ -255,27 +257,19 @@ func TestSpecialValues(t *testing.T) {
 	}
 }
 
-func TestPutAtMetadataRecovery(t *testing.T) {
+func TestClockMetadataRecovery(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "metadata.log")
 	s := NewStore(path)
-	const timestamp int64 = 1720000000000000123
-
-	if err := s.PutAt("name", "old", timestamp-1); err != nil {
+	versions, err := s.PutWithClock("name", "Parimal", vectorclock.VectorClock{"n1": 1})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.PutAt("name", "Parimal", timestamp); err != nil {
-		t.Fatal(err)
-	}
-
+	timestamp := versions[0].Ts
 	check := func(s *Store) {
 		t.Helper()
 		value, ts, exists, err := s.GetWithMeta("name")
 		if err != nil || !exists || value != "Parimal" || ts != timestamp {
-			t.Fatalf("unexpected metadata: value=%q ts=%d exists=%v err=%v", value, ts, exists, err)
-		}
-		value, exists, err = s.Get("name")
-		if err != nil || !exists || value != "Parimal" {
-			t.Fatalf("Get wrapper: value=%q exists=%v err=%v", value, exists, err)
+			t.Fatalf("metadata: %q %d %t %v", value, ts, exists, err)
 		}
 	}
 	check(s)
@@ -287,81 +281,59 @@ func TestPutAtMetadataRecovery(t *testing.T) {
 	check(recovered)
 }
 
-func TestLegacyWALTimestamp(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "legacy.log")
-	legacy := []byte("{\"op\":\"PUT\",\"key\":\"name\",\"value\":\"Parimal\"}\n")
-	if err := os.WriteFile(path, legacy, 0644); err != nil {
-		t.Fatal(err)
-	}
-	s := NewStore(path)
-	defer s.Close()
-	value, ts, exists, err := s.GetWithMeta("name")
-	if err != nil || !exists || value != "Parimal" || ts != 0 {
-		t.Fatalf("legacy metadata: value=%q ts=%d exists=%v err=%v", value, ts, exists, err)
+func TestLegacyWALRejectedWithoutModification(t *testing.T) {
+	legacy := `{"op":"PUT","key":"name","value":"old","ts":123}` + "\n"
+	clocked := `{"op":"PUT","key":"name","value":"new","vc":{"n1":1},"ts":10}` + "\n"
+	for name, contents := range map[string]string{
+		"timestamp only":              legacy,
+		"no timestamp":                `{"op":"PUT","key":"name","value":"old"}` + "\n",
+		"null clock":                  `{"op":"PUT","key":"name","value":"old","vc":null}` + "\n",
+		"legacy with incomplete tail": legacy + `{"op":"PUT","key":"unfinished"`,
+		"mixed formats":               clocked + legacy,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "legacy.wal")
+			if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+				t.Fatal(err)
+			}
+			var failure any
+			func() {
+				defer func() { failure = recover() }()
+				opened := NewStore(path)
+				opened.Close()
+			}()
+			if failure == nil || !strings.Contains(fmt.Sprint(failure), "fresh --data path") {
+				t.Fatalf("expected clear legacy failure, got %v", failure)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil || string(after) != contents {
+				t.Fatalf("rejected WAL was modified: %v", err)
+			}
+		})
 	}
 }
 
 func TestMetadataReadStates(t *testing.T) {
 	s := NewStore(filepath.Join(t.TempDir(), "states.log"))
 	defer s.Close()
-
 	value, ts, exists, err := s.GetWithMeta("missing")
 	if err != nil || exists || value != "" || ts != 0 {
-		t.Fatalf("missing key: value=%q ts=%d exists=%v err=%v", value, ts, exists, err)
+		t.Fatalf("missing: %q %d %t %v", value, ts, exists, err)
 	}
-	if err := s.Put("empty", ""); err != nil {
+	if _, err := s.PutWithClock("empty", "", vectorclock.VectorClock{"n1": 1}); err != nil {
 		t.Fatal(err)
 	}
 	value, ts, exists, err = s.GetWithMeta("empty")
 	if err != nil || !exists || value != "" || ts <= 0 {
-		t.Fatalf("Put wrapper: value=%q ts=%d exists=%v err=%v", value, ts, exists, err)
+		t.Fatalf("empty: %q %d %t %v", value, ts, exists, err)
 	}
-
 	s.mu.Lock()
 	s.failed = true
 	s.mu.Unlock()
-	if err := s.PutAt("empty", "changed", 123); err == nil {
-		t.Fatal("PutAt must reject writes while unhealthy")
+	if _, err := s.PutWithClock("empty", "changed", vectorclock.VectorClock{"n1": 2}); err == nil {
+		t.Fatal("unhealthy write accepted")
 	}
 	if _, _, _, err := s.GetWithMeta("empty"); err == nil {
-		t.Fatal("GetWithMeta must reject reads while unhealthy")
+		t.Fatal("unhealthy read accepted")
 	}
-}
-
-func TestOlderWriteDoesNotReplaceNewer(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "wal")
-	s := NewStore(path)
-	for _, version := range []struct {
-		value string
-		ts    int64
-	}{{"fresh", 200}, {"stale", 100}} {
-		if err := s.PutAt("key", version.value, version.ts); err != nil {
-			t.Fatal(err)
-		}
-	}
-	check := func(s *Store) {
-		t.Helper()
-		value, ts, exists, err := s.GetWithMeta("key")
-		if err != nil || !exists || value != "fresh" || ts != 200 {
-			t.Fatalf("got %q %d %t %v", value, ts, exists, err)
-		}
-	}
-	check(s)
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
-	// Simulate an older WAL produced before timestamp-aware replay existed.
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.WriteString("{\"op\":\"PUT\",\"key\":\"key\",\"value\":\"stale\",\"ts\":100}\n"); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatal(err)
-	}
-	recovered := NewStore(path)
-	defer recovered.Close()
-	check(recovered)
 }

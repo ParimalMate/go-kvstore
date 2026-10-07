@@ -60,7 +60,7 @@ func TestWriteQuorumReturnsBeforeSlowPeer(t *testing.T) {
 	s := store.NewStore(filepath.Join(t.TempDir(), "wal"))
 	defer s.Close()
 	// Three peers plus the coordinator means N=4; W=2, R=3 overlap.
-	h := NewHandler(s, logger, peers, 2, 3)
+	h := NewHandler(s, logger, peers, 2, 3, "n1")
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /kv/{key}", h.PutHandler)
 	response := httptest.NewRecorder()
@@ -93,7 +93,7 @@ func TestWriteQuorumOneStillReplicates(t *testing.T) {
 	addr := strings.TrimPrefix(peer.URL, "http://")
 	s := store.NewStore(filepath.Join(t.TempDir(), "wal"))
 	defer s.Close()
-	h := NewHandler(s, log.New(logs, "", 0), []string{addr}, 1, 2)
+	h := NewHandler(s, log.New(logs, "", 0), []string{addr}, 1, 2, "n1")
 	req := httptest.NewRequest(http.MethodPut, "/kv/name", strings.NewReader("Parimal"))
 	req.SetPathValue("key", "name")
 	response := httptest.NewRecorder()
@@ -133,7 +133,7 @@ func TestWriteQuorumInsufficientAcks(t *testing.T) {
 			badAddr := strings.TrimPrefix(bad.URL, "http://")
 			s := store.NewStore(filepath.Join(t.TempDir(), "wal"))
 			defer s.Close()
-			h := NewHandler(s, log.New(logs, "", 0), []string{goodAddr, badAddr}, 3, 1)
+			h := NewHandler(s, log.New(logs, "", 0), []string{goodAddr, badAddr}, 3, 1, "n1")
 			req := httptest.NewRequest(http.MethodPut, "/kv/name", strings.NewReader("Parimal"))
 			req.SetPathValue("key", "name")
 			response := httptest.NewRecorder()
@@ -175,7 +175,7 @@ func TestWriteQuorumLocalFailureDoesNotReplicate(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	h := NewHandler(s, log.New(io.Discard, "", 0), []string{strings.TrimPrefix(peer.URL, "http://")}, 2, 1)
+	h := NewHandler(s, log.New(io.Discard, "", 0), []string{strings.TrimPrefix(peer.URL, "http://")}, 2, 1, "n1")
 	req := httptest.NewRequest(http.MethodPut, "/kv/name", strings.NewReader("Parimal"))
 	req.SetPathValue("key", "name")
 	response := httptest.NewRecorder()

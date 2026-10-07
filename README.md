@@ -1,607 +1,521 @@
-# Persistent Key-Value Store in Go
+# Distributed Key-Value Store in Go
 
-A simple single-node key-value store built in Go. It exposes an HTTP API
-for storing and retrieving string values, keeps data in memory for fast
-access, and uses a Write-Ahead Log (WAL) to recover data after a
-restart.
+An educational distributed key-value store with durable per-node write-ahead
+logs, concurrent replication, configurable read/write quorums, and vector
+clocks for detecting conflicting versions.
 
-> **Project status:** Milestone 1 (single-node persistence) is
-> implemented. The project is a learning implementation and is not
-> intended to be a production database.
+**Project status:** Milestones 1–4 are implemented and verified. Milestone 4
+preserves concurrent versions as siblings and returns them with HTTP 300
+Multiple Choices. Gossip membership is the next milestone; background
+anti-entropy and automatic replica repair are not implemented yet.
+
+All nodes in a cluster must use the current vector-clock protocol. Do not
+mix Milestone 3 and Milestone 4 binaries or reuse timestamp-only WAL files
+with the current binary. Existing old WALs are rejected without alteration.
 
 ## Contents
 
--   [Overview](#overview)
--   [Features](#features)
--   [Architecture](#architecture)
--   [Requirements](#requirements)
--   [Project structure](#project-structure)
--   [Build and run](#build-and-run)
--   [HTTP API](#http-api)
--   [Write-Ahead Log](#write-ahead-log)
--   [Concurrency and failures](#concurrency-and-failures)
--   [Testing](#testing)
--   [Automated checkpoints](#automated-checkpoints)
--   [Limitations](#limitations)
--   [Milestone 2 direction](#milestone-2-direction)
+- [Overview](#overview)
+- [Features](#features)
+- [Architecture](#architecture)
+- [Requirements](#requirements)
+- [Project structure](#project-structure)
+- [Build and run](#build-and-run)
+- [HTTP API](#http-api)
+- [Write-Ahead Log](#write-ahead-log)
+- [Concurrency and failures](#concurrency-and-failures)
+- [Testing and verification scripts](#testing-and-verification-scripts)
+- [Limitations](#limitations)
+- [Milestone history](#milestone-history)
+- [Vector clocks and conflict detection](#vector-clocks-and-conflict-detection)
 
 ## Overview
 
-The store maps string keys to string values. Data is held in an
-in-memory Go map and persisted to a local WAL file. When the server
-starts, it replays valid WAL records to reconstruct the map.
+Each node holds a map from a string key to a list of sibling versions. Each
+version contains a string value, a vector clock, and a local informational
+storage timestamp. A local WAL allows versions to survive a restart.
 
-The current implementation is a **single-node** store. Running two
-instances creates two independent stores when each instance uses a
-different port and WAL file. The instances do not replicate data to each
-other.
+Any node can coordinate a client request. Writes persist locally before
+being sent to every configured peer. The client receives success after W
+acknowledgements, including the local write. Reads collect R valid replica
+answers, combine their sibling lists, and remove duplicates and causally
+dominated versions. Concurrent versions are returned to the caller rather
+than silently resolved by wall-clock time.
+
+The standard three-node configuration is N=3, W=2, R=2. Startup requires
+1 <= W,R <= N and W+R>N, where N=len(peers)+1. The overlap condition applies
+to the same fixed set of distinct replicas. It does not provide consensus,
+linearizability, or automatic conflict resolution. Configure unique stable
+node IDs and list each actual peer once, consistently across the cluster.
 
 ## Features
 
--   HTTP endpoints to put and get key-value pairs.
--   In-memory map for reads.
--   JSON-encoded, newline-delimited WAL records.
--   WAL replay during startup.
--   `Sync()` before acknowledging a successful write.
--   Mutex-based synchronization for concurrent access.
--   Detection and truncation of an incomplete final WAL record.
--   Unhealthy-state handling after WAL write or sync failures.
--   Graceful shutdown on `SIGINT` and `SIGTERM`.
--   Configurable listening port and WAL path.
--   Unit tests, concurrency tests, and race-detector checks.
+- External HTTP PUT and quorum GET endpoints.
+- Concurrent all-peer replication with an early response after W acks.
+- Vector-clock comparison, joining, and concurrent sibling retention.
+- HTTP 300 responses exposing unresolved versions and their clocks.
+- A shared dominance rule for live writes, recovery, and read reconciliation.
+- JSON-lines WAL, Sync before publishing accepted local writes, and torn-tail recovery.
+- Store health checks after write or sync failures.
+- Locks protecting the store and coordinator clock creation.
+- Signal-driven HTTP shutdown and independent two-second replication attempts.
+- Unit tests, race-detector tests, and real-process cluster verification scripts.
 
 ## Architecture
 
-``` text
-                   HTTP request
+```text
+Client PUT -> coordinator handler
+              read local siblings -> join clocks -> increment own counter
                         |
                         v
-                 Go HTTP server
+                  PutWithClock
+              compare -> WAL + Sync -> memory
                         |
                         v
-                 Store methods
+           parallel internal PUTs to all peers
+              each peer applies the same rule
                         |
-               +--------+--------+
-               |                 |
-               v                 v
-          In-memory map      WAL file
-            (data)        (append records)
-               ^                 |
-               |                 v
-               +---------- Sync()
+                        v
+          respond after W total acknowledgements
+
+Client GET -> local siblings + parallel internal GETs
+              collect R valid replica answers
+                        |
+                        v
+           combine versions and prune by vector clock
+                        |
+               404 / 200 single value / 300 siblings
 ```
 
-A successful `PUT` follows this order:
-
-1.  Acquire the store mutex.
-2.  Reject the operation if the store is marked unhealthy.
-3.  Encode the operation as a WAL record.
-4.  Append the record to the WAL.
-5.  Call `Sync()` on the WAL file.
-6.  Update the in-memory map.
-7.  Return success.
-
-The ordering is important: the in-memory state is changed only after the
-WAL write and sync report success.
+A read computes its response without updating the local or peer stores.
+An internal PUT never forwards the write again and never increments its
+clock. W=1 can respond immediately after the local write, while peer
+attempts continue. R=1 reads only local state.
 
 ## Requirements
 
--   Go installed and available on `PATH`.
--   `curl` for the HTTP examples and checkpoint script.
--   A Unix-like shell (such as macOS Terminal, Linux shell, or the VS
-    Code integrated terminal) to run `checkpoint.sh`.
-
-Check your Go installation:
-
-``` bash
-go version
-```
+- Go compatible with the version declared in `go.mod`.
+- `curl` for examples and quorum timing checks.
+- Bash and POSIX signals for `checkpoint.sh` and cluster scripts.
+- Python 3 for the two real-cluster verification scripts; no third-party
+  Python packages are required.
 
 ## Project structure
 
-The exact structure may vary as the project evolves. A typical layout
-is:
-
-``` text
-kvstore/
-├── main.go
-├── store_test.go
-├── checkpoint.sh
-├── go.mod
-└── README.md
+```text
+cmd/server/main.go              flags, startup validation, routing, shutdown
+internal/api/handlers.go        coordinator writes, quorum reads, peer handlers
+internal/replication/client.go  HTTP peer protocol and concurrent fan-out
+internal/store/store.go        sibling state, dominance, WAL and recovery
+internal/vectorclock/           Compare, Merge, and isolated clock tests
+internal/api/*_test.go          HTTP, quorum, conflict, and concurrency tests
+internal/replication/*_test.go   peer writes and replication-lifetime tests
+internal/store/*_test.go         persistence, siblings, recovery, legacy rejection
+scripts/check-quorum-cluster.py pause/outage/stale-read checks
+scripts/check-vectorclock-cluster.py  directed partition/conflict checks
+checkpoint.sh                  standalone persistence and shutdown checks
+run-cluster.sh                 interactive three-node launcher
 ```
-
-WAL files are created at the path passed through the `-data` flag. The
-automated checkpoint script uses a temporary directory for its WAL and
-output log files and removes that directory when it exits.
 
 ## Build and run
 
-Run commands from the project directory---the directory containing
-`go.mod`.
+Run from the repository root:
 
-### Run with default settings
-
-``` bash
-go run .
+```bash
+go build -o server ./cmd/server
 ```
 
-If your `main.go` is the only entry point, `go run main.go` also works.
+### Standalone node
 
-### Configure port and WAL file
+Without peers, N=1, so override the default quorum sizes:
 
-``` bash
-go run . -port 5001 -data store-a.log
+```bash
+./server --id n1 --port 8080 --data n1-m4.wal --w 1 --r 1
 ```
 
--   `-port` selects the HTTP port.
--   `-data` selects the WAL file path.
+### Three-node cluster
 
-The WAL file is created if it does not already exist. Use a stable path
-if you want the data to be available after restarting the server.
+Run each command in a separate terminal, using fresh Milestone 4 WAL paths:
 
-### Run two independent instances
-
-Open two terminals in the project directory.
-
-Terminal 1:
-
-``` bash
-go run . -port 5001 -data store-a.log
+```bash
+./server --id n1 --port 8081 --data n1-m4.wal --peers localhost:8082,localhost:8083 --w 2 --r 2
 ```
 
-Terminal 2:
-
-``` bash
-go run . -port 5002 -data store-b.log
+```bash
+./server --id n2 --port 8082 --data n2-m4.wal --peers localhost:8081,localhost:8083 --w 2 --r 2
 ```
 
-Each process has its own memory and WAL file. A write to one instance
-will not automatically appear in the other.
+```bash
+./server --id n3 --port 8083 --data n3-m4.wal --peers localhost:8081,localhost:8082 --w 2 --r 2
+```
 
-**Important:** Do not run two instances against the same WAL file. This
-implementation is not designed for multiple processes to concurrently
-own one WAL.
+Each node must own a different WAL file. On restart, keep the same node ID
+and WAL path. Press Ctrl+C for HTTP shutdown. The existing `run-cluster.sh`
+launcher also starts three nodes, but uses `n1.log`, `n2.log`, and `n3.log`:
+if those contain Milestone 3 data, preserve them and use the explicit fresh
+paths above instead.
 
-### Stop the server
-
-Press `Ctrl+C` in the terminal running the server. The application
-handles `os.Interrupt` and `SIGTERM` to initiate graceful shutdown.
+Two nodes with no configured peers and W=R=1 are independent stores. Nodes
+replicate only to the peers explicitly listed; automatic discovery/gossip
+is not implemented yet.
 
 ## HTTP API
 
-The examples below assume the handlers use the `/kv/{key}` route and a
-successful `PUT` returns HTTP `200`, as implemented in the project.
+The following examples target the three-node cluster above.
 
-### Put a value
-
-``` bash
-curl -i -X PUT http://localhost:5001/kv/name \
-  -H "Content-Type: text/plain" \
-  -d "Parimal"
+```bash
+curl -i -X PUT http://localhost:8081/kv/name --data-binary 'Parimal'
+curl -i http://localhost:8082/kv/name
 ```
 
-A successful request returns an HTTP success status and the handler's
-success response.
+External PUT accepts a raw string, limited to 1 MiB. It returns 200 with
+`OK` when W acks are reached; insufficient acknowledgements return 503 with
+`replicated` and `failed` lists. Those lists describe results collected so
+far and may omit attempts still in flight. A 503 does not roll back the
+local write or successful replicas.
 
-### Get a value
+External GET returns:
 
-``` bash
-curl -i http://localhost:5001/kv/name
+| Situation | Status and body |
+| --- | --- |
+| One surviving version | 200, plain value |
+| Multiple concurrent versions | 300, JSON array of `{value, vc}` |
+| All R valid answers report absence | 404 |
+| Fewer than R valid answers | 503 |
+| Local store unhealthy | 500 |
+| Equal clocks with different values in read answers | 502 |
+
+For example, a conflict can return:
+
+```json
+[{"value":"Mumbai","vc":{"n1":2}},{"value":"Pune","vc":{"n1":1,"n2":1}}]
 ```
 
-The response body contains the stored value.
+The caller chooses or combines application values. Sending a new PUT to a
+coordinator that knows both histories supersedes both. A coordinator that
+knows only one may create another concurrent version; see the concrete
+examples under [known limitations](#known-limitation-the-coordinator-knows-only-local-history).
 
-### Missing key
-
-``` bash
-curl -i http://localhost:5001/kv/unknown
-```
-
-A key that is not present returns `404 Not Found`.
-
-### Example using two servers
-
-Write to Server A:
-
-``` bash
-curl -i -X PUT http://localhost:5001/kv/name \
-  -H "Content-Type: text/plain" \
-  -d "Parimal"
-```
-
-Read from Server A:
-
-``` bash
-curl http://localhost:5001/kv/name
-```
-
-Read from Server B:
-
-``` bash
-curl -i http://localhost:5002/kv/name
-```
-
-If the key has not been written to Server B, it should return
-`404 Not Found`. This illustrates that the instances are independent,
-not replicated.
+Peer-facing endpoints use the same key path under `/internal/kv/{key}`.
+Internal PUT accepts `{value, vc}`; internal GET returns the full sibling
+array, or `[]` for an absent key. Invalid payloads return 400; oversized
+bodies/values return 413. Internal equal-clock/different-value collisions
+return 409. Internal GET never performs another fan-out.
 
 ## Write-Ahead Log
 
-The WAL stores each mutation as a JSON record followed by a newline. For
-example:
+Accepted state-changing writes append one JSON record followed by a newline:
 
-``` json
-{"op":"PUT","key":"name","value":"Parimal"}
+```json
+{"op":"PUT","key":"name","value":"Parimal","ts":123456789,"vc":{"n1":1}}
 ```
 
-The newline acts as a record delimiter. During startup, the store scans
-the WAL and replays supported records into the in-memory map.
+The key and clock are persisted along with the value. `ts` records this
+node's first-storage time for the version. It is informational only, is
+not replicated, and never determines which version wins. Duplicate and
+stale deliveries change neither memory nor the WAL.
 
-### Why write the WAL first?
+The store computes the proposed siblings, appends and syncs the incoming
+record, and only then publishes the new in-memory list. Recovery applies
+the same dominance rule without appending records again. Historical WAL
+records can remain even when their versions are no longer current siblings.
 
-If the process stops after a successful WAL sync but before updating the
-in-memory map, the next startup can replay the record and restore the
-value. The WAL is therefore the persistence source used to rebuild
-in-memory state.
-
-### Startup recovery
-
-At startup, the implementation:
-
-1.  Opens the configured WAL file.
-2.  Removes an incomplete, unterminated tail fragment, if present.
-3.  Reads the WAL records.
-4.  Decodes supported records and replays `PUT` operations into the map.
-5.  Starts serving requests after recovery completes.
-
-For repeated writes to the same key, replaying records in order leaves
-the latest value in the map.
-
-### Incomplete tail recovery
-
-A process may stop while a record is being appended, leaving a final
-fragment without a newline. The current `recoverWALTail` helper
-truncates bytes after the last newline. This handles an incomplete final
-record, but it is not a general-purpose corruption repair mechanism.
+Startup validates/replays complete records before truncating an incomplete
+final fragment. A complete PUT without a vector clock fails startup and
+leaves the old file unchanged. Malformed complete JSON records are skipped;
+this is not general corruption repair. Reading the WAL into memory and
+unbounded WAL growth are current limitations.
 
 ## Concurrency and failures
 
-### Mutex
+The store mutex protects in-memory data and WAL writes. A separate handler
+mutex covers the entire local read/join/increment/store operation and
+incoming internal writes. It is released before network calls. A third,
+request-local mutex protects the write-quorum collector's result lists.
 
-The store uses a `sync.Mutex` to serialize access to shared state and
-the WAL. This prevents concurrent goroutines from modifying the map or
-appending WAL records at the same time through the store methods.
+Write and read fan-outs use bounded independent contexts. Buffered result
+channels let background collectors finish and log attempts after a quorum
+response. Background replication is not a durable queue: process exit can
+stop attempts, and shutdown does not wait for every outstanding collector.
 
-### Sync failures and ambiguous outcomes
+WAL write, short-write, or sync errors mark the store unhealthy. A restart
+is required before serving from recovered state. A failed sync is ambiguous:
+the record may or may not survive. A network/quorum failure can also leave
+a partially persisted write visible to later reads. Identical replication
+deliveries are deduplicated by clock and value; retrying an external PUT
+creates a new clock and is not request-ID deduplication.
 
-A successful `Write()` does not by itself prove that data has reached
-persistent storage. `Sync()` asks the operating system to flush file
-changes to stable storage, but it can return an error.
+## Testing and verification scripts
 
-If `Write()` succeeds and `Sync()` fails, the record might still be
-present after a restart---or it might not be. The client receives an
-error, but the final outcome can be uncertain. This is commonly called
-an **ambiguous commit**.
+All test files and verification scripts live in the repository.
 
-The current implementation responds conservatively:
-
--   Marks the store unhealthy after a WAL write, short-write, or sync
-    error.
--   Rejects later `Put` and `Get` calls while unhealthy.
--   Requires a restart so the store can reconstruct state from the WAL.
-
-An error from `Sync()` should therefore not be interpreted as proof that
-the write was absent. Repeating a `PUT` of the same key and value is
-effectively idempotent for this simple API, but more complex operations
-may need unique request IDs or deduplication.
-
-### HTTP errors
-
-The handlers report errors to the client using HTTP error statuses.
-Check the handler implementation for the precise response body and
-status mapping in your current revision.
-
-## Testing
-
-Run the unit tests:
-
-``` bash
-go test ./...
+```bash
+go test -race -count=1 ./...
+go vet ./...
 ```
 
-Run tests with the Go race detector:
+The suite covers causal ordering, independent map copies, dominance and
+sibling collapse, duplicate/stale writes, WAL recovery and torn tails,
+legacy-file preservation, wire validation, 200/300 responses, quorum
+failure/deadline behavior, same-node concurrent writes, and restart counters.
+Closed-WAL tests exercise write failure; there is no full power-loss or
+hardware-failure simulation.
 
-``` bash
-go test -race ./...
+Run real-process checks:
+
+```bash
+bash checkpoint.sh
+python3 scripts/check-quorum-cluster.py
+python3 scripts/check-vectorclock-cluster.py
 ```
 
-The current test suite covers:
-
--   Basic put/get behavior.
--   Recovery from the WAL after creating a new store.
--   Concurrent access.
--   Recovery from an incomplete WAL tail.
--   Rejection of reads and writes when the store is marked unhealthy.
-
-The unhealthy-state test sets the failure flag directly. It verifies the
-store's fail-closed behavior, but does not simulate an actual
-operating-system disk write or sync failure.
-
-## Automated checkpoints
-
-The `checkpoint.sh` script performs practical integration checks using
-two temporary server instances and separate temporary WAL files.
-
-Run it from the project directory:
-
-``` bash
-chmod +x checkpoint.sh
-./checkpoint.sh
-```
-
-The script builds the server and checks that:
-
-1.  Two servers can start on separate ports.
-2.  Each server stores independent data.
-3.  A server can restart and recover its data from its WAL.
-4.  A server stops responding after receiving `SIGTERM`.
-5.  The other server remains operational independently.
-
-The script uses ports `5011` and `5012` and a temporary directory. It
-cleans up the temporary test files when it exits. Ensure those ports are
-available before running it.
-
-These integration checks complement, rather than replace, the unit tests
-and race-detector run. They do not test replication, real disk failures,
-power loss, or every possible shutdown race.
+`checkpoint.sh` runs two intentionally independent W=R=1 nodes on ports
+5011 and 5012 to test persistence and shutdown. The Python scripts choose
+loopback ports dynamically, build temporary binaries, use temporary WALs,
+and clean up their own processes and files. The quorum script uses curl to
+measure healthy, paused-peer, and dead-peer writes and checks stale reads.
+The vector-clock script blocks the two coordinator links with local HTTP
+proxies and verifies both concurrent versions survive quorum reads.
 
 ## Limitations
 
-This is an educational single-node implementation. Current limitations
-include:
+- No automatic conflict resolution or client-supplied causal context.
+  Sequential writes through different coordinators can appear concurrent
+  if the second coordinator has not learned the first write.
+- No read repair, anti-entropy, or automatic catch-up after a missed write.
+- Static peer membership; gossip/discovery is not implemented yet.
+- No leader election, consensus, or claim of linearizable operations.
+- No authentication, authorization, or TLS; peer endpoints are not protected.
+- No WAL compaction/rotation; recovery reads the WAL into memory.
+- No general repair of corrupted complete WAL records.
+- No request-ID deduplication, durable retry queue, or guaranteed background
+  replication drain on shutdown.
+- No automatic migration of timestamp-only Milestone 3 WALs.
+- Sibling counts are not automatically capped or resolved; peer read bodies
+  above 64 MiB are rejected rather than partially interpreted.
+- Node IDs must be unique and retain their history across restarts. Reusing
+  an ID after losing its WAL can cause clock collisions.
 
--   No replication between instances.
--   No leader election, consensus protocol, or distributed coordination.
--   No authentication, authorization, or TLS.
--   No compaction or WAL segment rotation; the WAL grows as writes
-    accumulate.
--   The simple tail-recovery approach reads the WAL into memory, which
-    is not suitable for arbitrarily large files.
--   It truncates an incomplete final fragment but does not robustly
-    repair malformed complete records or corruption in the middle of the
-    WAL.
--   No injected disk-failure testing.
--   No request-ID deduplication for operations with non-idempotent
-    effects.
--   No production-grade backup, metrics, or operational tooling.
+This is a learning implementation, not a production database. Planned
+anti-entropy can deliver missing histories, but cannot invent client causal
+context or automatically choose among concurrent application values.
 
-## Milestone 2 direction
+## Milestone history
 
-Milestone 2 can extend this foundation into a distributed KV store.
-Topics to design and implement incrementally include:
+| Milestone | Completed behavior |
+| --- | --- |
+| 1 | Local memory store, durable WAL, recovery, HTTP, shutdown |
+| 2 | Concurrent peer replication, internal writes, failure logging |
+| 3 | W/R quorums, early write responses, timestamp-based version selection |
+| 4 | Vector clocks, sibling retention, cross-replica pruning, HTTP 300 conflicts |
 
--   Node-to-node communication.
--   Replication of writes and data recovery across nodes.
--   Handling timeouts, unreachable nodes, and partial failures.
--   Choosing a coordination model, such as a leader-based design.
--   Defining consistency and acknowledgement guarantees.
--   Preventing duplicate application of retried requests.
+Milestone 3's last-write-wins timestamp policy could silently discard
+independent updates. The current implementation instead preserves concurrent
+histories and surfaces them to the caller. Timestamp-only internal payloads
+and WALs belong to the historical implementation, not the current protocol.
 
-The current two-server checkpoint only proves that two independent
-processes can run at once. It does **not** establish distributed storage
-or replication.
+## Vector clocks and conflict detection
 
-## Replication Semantics
+The standalone `internal/vectorclock` package provides `VectorClock`,
+`Compare` (Equal, Before, After, Concurrent), and `Merge` (elementwise max).
+Missing counters mean zero. Merge returns a separate map; neither function
+modifies its inputs. Counters must be nonnegative.
 
-### Milestone 3 preparation: quorum configuration
+The store now holds a slice of exported `Entry` values per key, each with
+`Value`, `VC`, and `Ts`. `PutWithClock` applies the causal dominance rule;
+`GetSiblings` returns all versions as independent copies, including copied
+clock maps. For clocked entries, Ts records the local first-storage time
+and is preserved on replay. It is never used to choose between clocked
+versions. Stale writes and identical duplicate deliveries leave the state
+and WAL unchanged. Equal clocks carrying different values are rejected as
+inconsistent input rather than silently choosing a value.
 
-The server accepts `--w` and `--r` flags, both defaulting to `2`.
-`N` is the number of configured peers plus the local node. Startup rejects
-configurations unless `1 <= W <= N`, `1 <= R <= N`, and `W + R > N`.
-Validation happens before opening the WAL or starting the HTTP listener.
+Live clocked writes and WAL recovery share `resolveSiblings`. The live path
+appends and syncs the WAL before publishing changed memory; replay applies
+the same rule without appending. Caller-owned and returned maps cannot be
+used to mutate the store's clocks. Callers must not concurrently mutate an
+input map while a store method is reading it.
 
-For the three-node cluster, the defaults give `N=3, W=2, R=2`.
-For a standalone node without peers, explicitly pass `--w 1 --r 1`:
+### Coordinator writes and replication
 
-```bash
-go run ./cmd/server --w 1 --r 1
-```
+`main` passes `--id` to the handler. For an external PUT, `coordinateWrite`
+reads that key's local siblings, joins their clocks, increments only its
+own node ID, and calls `PutWithClock`. A handler mutex covers this complete
+sequence and internal peer writes, preventing same-node requests from
+allocating the same next clock. Production uses one handler per store.
+The mutex is released before any network operation. Counter overflow is
+rejected instead of wrapping. Node IDs must be unique and stable across
+restarts; use the same WAL with the same ID. Reusing an ID after losing its
+history can create equal-clock collisions and is not handled automatically.
 
-Both values are now passed into the API handler. Writes use W to decide
-when to acknowledge success; reads collect R valid answers, including
-the local lookup, before selecting a value. The overlap condition guarantees that
-a read quorum and a successful write quorum share at least one replica
-when drawn from the same replica set; it does not by itself guarantee
-strong consistency or resolve concurrent writes.
+Replication sends the same value and clock to all peers. Peers call
+`PutWithClock` without incrementing or joining the incoming clock. The W
+acknowledgement rule, independent two-second lifetime, and background result
+logging continue to work as in Milestone 3. Ts now records each replica's
+local first-storage time; it is not sent to peers or compared by handlers.
 
-Writes are applied to the receiving node locally before replication is
-attempted. The local write is appended to the WAL and synced before the
-node forwards the value to its configured peers.
+### Breaking peer protocol change
 
-Milestone 2 required every configured peer to acknowledge. The first
-Milestone 3 increment now counts the durable local write as one ack,
-attempts every configured peer, and returns 200 as soon as W total acks
-are collected. With N=3 and W=2, one successful peer is enough even if the
-other peer is slow or unavailable. W=1 returns after local persistence
-while still attempting all peers.
-
-A background collector drains and logs every result, including results
-arriving after the HTTP response. A mutex protects its success/failure
-lists, and sync.Once closes a quorum notification channel exactly once.
-The handler waits for that notification or the independent two-second
-replication context. If all attempts finish without a quorum, it can fail
-earlier. Insufficient acks produce 503 with the same `replicated`/`failed`
-JSON fields as Milestone 2. At a deadline, this is a snapshot of results
-collected so far; still-pending peers may not yet appear in either list.
-
-A replication failure does not roll back successful writes. The receiving
-node and any peers that successfully processed the request retain the
-value. Therefore, a partial replication failure can temporarily leave
-nodes with different state.
-
-A node that was unavailable during a write does not automatically receive
-the missed value when it restarts. Repairing this temporary inconsistency
-is outside Milestone 2 and will be handled by later anti-entropy
-functionality.
-
-### Milestone 3 preparation: timestamp storage
-
-The local store now retains a value and an `int64` timestamp per key.
-`PutAt(key, value, ts)` persists the supplied timestamp in memory
-and in the WAL unless a higher timestamp is already stored. Such an older
-write is acknowledged without replacing the newer durable version. `GetWithMeta` returns it alongside the value and existence
-flag. The existing `Put` generates a timestamp with `time.Now().UnixNano()`;
-`Get` returns only the value, existence flag, and error as before.
-Old WAL records without `ts` recover with timestamp zero.
-
-Live writes and WAL replay retain the higher timestamp, so delayed older
-writes cannot erase a newer version. Equal timestamps still use arrival
-order locally; quorum reads retain the first encountered value on a tie.
-Equal-timestamp conflicting values are an unresolved milestone limitation. For an external PUT, the coordinator now
-generates one timestamp and uses `PutAt` locally. It passes that same
-timestamp through `FanOut` and `Replicate` to every peer.
-
-Internal PUT now accepts JSON `{"value":"Parimal","ts":1720000000000000123}`
-and persists it using `PutAt`, without generating a new timestamp or
-forwarding again. Both fields are required and must be non-null; `ts` must
-be an `int64` integer. Empty values and timestamp zero are accepted.
-Malformed payloads return 400. External PUT still accepts the raw value.
-Both endpoints limit the decoded value to 1 MiB; internal PUT allows up to
-6 MiB plus 1024 bytes of JSON body to accommodate escaping and metadata.
-Oversized requests return 413. All running peers must use this JSON
-protocol; the internal endpoint no longer accepts the old raw body format.
-
-Physical-clock timestamps are a deliberate Milestone 3 simplification.
-They do not eliminate clock skew between coordinators, clock adjustments,
-or equal timestamps, and cannot reliably describe causal ordering.
-Milestone 4 is planned to introduce vector clocks to track causal order
-and identify concurrent versions; resolving those conflicts remains a
-separate policy decision.
-
-Concurrent writes from two coordinators use last-write-wins by timestamp:
-the higher timestamp wins without detecting a conflict, even when the two
-values represent independent updates. That information loss is a known
-Milestone 3 boundary; vector clocks in Milestone 4 will make concurrency
-detectable rather than silently treating both writes as an ordered pair.
-
-### Milestone 3 preparation: internal reads
-
-`GET /internal/kv/{key}` reads only the receiving node's store and returns
-HTTP 200 with JSON containing `value`, `ts`, and `exists`:
+Internal PUT now requires:
 
 ```json
-{"value":"Parimal","ts":1720000000000000123,"exists":true}
+{"value":"Chennai","vc":{"n1":3,"n2":1}}
 ```
 
-A missing key is a successful lookup with HTTP 200 and
-`{"value":"","ts":0,"exists":false}`. An unhealthy store returns HTTP 500.
-This lets quorum reads distinguish a responding replica with no
-value from a failed lookup. The external `GET /kv/{key}` still returns
-plain text for an existing key and HTTP 404 when all R valid answers
-report absence. It returns 503 when fewer than R valid answers arrive.
+Internal GET returns a sibling array, including all unresolved versions:
 
-### Milestone 3: quorum reads
+```json
+[{"value":"Mumbai","vc":{"n1":2}},{"value":"Pune","vc":{"n1":1,"n2":1}}]
+```
 
-External GET reads local metadata first. When R > 1, `ReadFanOut` queries
-all peers concurrently through the shared HTTP client and a two-second
-background context. Querying all peers allows another healthy peer to
-answer when one fails; the handler stops waiting after R valid answers
-including its local lookup. Missing keys count as answers; network errors,
-non-200 statuses, and malformed metadata do not. Among those R answers,
-the handler selects the highest timestamp that has `exists=true`.
-R=1 needs only the local lookup. An unhealthy local store returns 500.
+An absent key returns `[]` with status 200. Timestamp-only PUT payloads,
+null clocks, negative counters, empty node IDs, and malformed payloads
+are rejected. An empty value and an empty clock object are valid. Values
+are limited to 1 MiB and encoded clocks to 64 KiB; internal PUT allows
+JSON escaping overhead. Peer GET responses are limited to 64 MiB total;
+a larger sibling response counts as a failed peer answer. This is an
+intentional protocol version change; upgrade all nodes together.
 
-A buffered collector logs every attempted peer's outcome, latency, and
-reported timestamp, including attempts that finish after the response.
-The handler logs the quorum decision and selected timestamp. Reads do not
-repair stale replicas.
+### Quorum reads and conflict responses
 
-For the same fixed set of N distinct replicas, W+R>N forces every
-R-replica read set to overlap every W-replica successful write set: there
-are only N-W replicas outside that write set, fewer than R. With versions
-retained by timestamp, the read therefore sees that write's timestamp or
-a higher one at an overlapping replica. This is a timestamp-order claim,
-not a guarantee of real-time ordering across skewed clocks. Reads may also
-observe writes whose clients received 503 after partial persistence.
-Configure each actual replica exactly once and use consistent membership
-on every node; address aliases are not a replica identity mechanism.
+A quorum GET collects R valid replica answers, combines their sibling
+lists, and calls the store's pure `Reconcile` helper. That helper shares
+the live-write/replay dominance rule, removing duplicates and dominated
+versions without modifying any replica. It never compares timestamps.
 
-### Milestone 3 preparation: independent replication lifetime
+- No surviving versions: 404.
+- One surviving version: 200 with its plain-text value.
+- Several concurrent versions: 300 Multiple Choices with the JSON sibling array.
+- Fewer than R valid answers: 503.
+- Equal clocks carrying different values in collected answers: 502.
 
-After the local write succeeds, external PUT creates a two-second context
-from `context.Background()` and passes it to `replication.FanOut`. Its
-background result collector owns cancellation and releases the timer when
-collection finishes. The handler does not defer cancellation when it
-returns an early quorum response. Client cancellation therefore does not
-cancel the peer writes. `StartFanOut` remains an independently timed helper
-for callers that only need a results channel.
+A 300 response exposes the surviving alternatives; the caller decides
+whether to select a value or merge values at the application level. The
+server does not use timestamps to guess a winner. Concurrent versions that
+reach the store or the collected read quorum are detected and preserved.
 
-The results channel has room for one result per peer. Replication remains
-in-process work, not a durable background queue: process exit stops any
-remaining attempts. Tracking outstanding replication during shutdown is
-not implemented in this increment.
+No read repair or client-provided causal context is implemented. A new external
+PUT automatically supersedes every version its coordinator currently
+knows, even if the client has not seen those siblings. Versions known only
+to another replica may remain concurrent. Logs report peer clocks and
+quorum decisions without logging the stored values.
 
-### Milestone 3 incremental validation
+### Known limitation: the coordinator knows only local history
 
-The write-quorum tests cover a fast peer, a peer delayed by 900ms, and a
-failing peer. With W=2 they require the response before 700ms and verify
-that the delayed success is still logged afterward. Three simulated peers
-plus the coordinator means N=4 in that test; it uses R=3 to preserve
-W+R>N. Other tests cover W=1, insufficient acks, timeout snapshots, local
-write failure, and client cancellation. Read tests cover freshest-version
-selection, missing and empty values, malformed replies, failed peers,
-R=1, R=3, early responses, and deadlines. Store tests cover delayed older
-writes and out-of-order WAL replay. The final commit and milestone tag
-remain upcoming steps.
+The external PUT body is only the new value. It does not carry a vector
+clock read by the client. The coordinator joins its local siblings, not
+all versions the client has observed or all versions elsewhere in the
+cluster. This is an intentional scope limit, not a guarantee of causal
+consistency for clients that move between coordinators.
 
-### Repeatable real-cluster checks
+**Resolving through a stale coordinator.** After the partition experiment:
 
-Run from the repository root (requires Go, Python 3, curl, and POSIX signals):
+```text
+n1: Mumbai {n1:2}
+n2: Pune   {n1:1,n2:1}
+n3: both versions
+```
+
+A quorum GET through n1 returns both versions, but does not store Pune on
+n1. A subsequent PUT of `Resolved-via-n1` through n1 creates `{n1:3}`.
+That clock is still concurrent with Pune's `{n1:1,n2:1}`, so a quorum read
+that sees both returns 300 again. A resolving PUT through n3, which knows
+both siblings, creates `{n1:2,n2:1,n3:1}` and supersedes both. This does
+not mean n3 is a special leader: any coordinator that has learned both
+histories can create such a superseding write.
+
+**Sequential client writes through a lagging replica.** With N=3, W=2,
+R=2, a PUT of `v1` through n1 can return 200 after n1 and n2 store
+`v1 {n1:1}`, while n3 is still missing it. The same client then PUTs `v2`
+through n3 before n3 learns v1. Because n3 has no local history for the
+key, it creates `v2 {n3:1}`. A later quorum read can return 300 with both
+v1 and v2 even though the client submitted its writes sequentially. The
+server cannot infer that client-observed order from a plain value body.
+
+Planned Milestone 6 anti-entropy will eventually deliver missing versions,
+allowing a later write on a repaired coordinator to cover those histories.
+It does not automatically resolve existing concurrent siblings or guarantee
+that a coordinator is caught up at the moment of every new write. An
+optional client-context protocol could carry the clocks returned by a read
+into the following write, preserving the dependencies the client observed.
+That protocol is not implemented. Until then, callers must account for the
+coordinator's knowledge when resolving a conflict.
+
+### Legacy data boundary
+
+The timestamp-only `Put` and `PutAt` store methods have been removed. All
+writes now supply a vector clock to `PutWithClock`; no version selection
+compares timestamps, including during startup recovery.
+
+A complete PUT record with a missing or null `vc` causes startup to fail
+with an explicit message directing the user to a fresh `--data` path.
+Startup validates and replays complete records before truncating an
+incomplete tail, so a rejected legacy WAL (including a mixed-format WAL)
+remains byte-for-byte unchanged. The file descriptor is closed on failure.
+A valid clocked WAL still recovers an incomplete tail as before. An
+explicit empty clock object `{}` is supported and differs from missing
+clock metadata.
+
+Preserve existing Milestone 3 WALs and use new paths for the Milestone 4
+exercises, for example `--data n1-m4.wal`. Automatic legacy migration is
+not implemented: wall-clock timestamps cannot reconstruct causal history.
+The Milestone 3 tag remains available for reading old data with its original
+implementation. `Ts` remains informational in new records, and the
+single-value `Get`/`GetWithMeta` helpers reject multiple siblings instead
+of choosing a winner.
+
+### Verification
+
+`go test -race -count=1 ./...` covers clock comparison, sibling dominance,
+WAL recovery, exact clock replication, old-protocol rejection, concurrent
+same-node PUTs, counters across restarts, counter overflow, conflict
+responses, explicit resolution by a later PUT, and the existing W/R quorum
+failure and timeout behavior. `scripts/check-quorum-cluster.py` now reads
+vector-clock metadata so the three-process pause/outage/stale-read checks
+remain usable with the new protocol.
+
+### Real three-node partition verification
+
+Run from the repository root:
 
 ```bash
-python3 scripts/check-quorum-cluster.py
+python3 scripts/check-vectorclock-cluster.py
 ```
 
-The script builds a temporary binary and launches three real server
-processes with N=3, W=2, R=2, separate temporary WALs, and dynamically
-chosen loopback ports. It uses curl's `time_total` to time requests. It
-pauses only its own n3 process with SIGSTOP, resumes it with SIGCONT, then
-separately kills and restarts n3 to create a persistent replication gap.
-It cleans up its processes and temporary files, including on failure.
+This uses three actual server processes with N=3, W=2, R=2, temporary WALs,
+and six directed loopback HTTP proxies. Each proxy represents one peer
+link. Blocking n1-to-n2 and n2-to-n1 returns a simulated link failure (503)
+without changing the host firewall. Both nodes can still reach n3, so both
+independent writes can achieve W=2. This is an application-level link-failure
+experiment, not a physical network disconnection.
 
-Observed on 2026-10-06 (five PUTs per scenario):
+The script first verifies ordinary sequential writes and converges `city`
+to `Delhi` with clock `{n1:1}` on every node. It then blocks the two
+coordinator links, writes `Mumbai` through n1 and `Pune` through n2, and
+checks the exact local versions before restoring communication:
 
-| Scenario | Successful PUTs | Median latency | Maximum latency |
-| --- | --- | --- | --- |
-| All nodes healthy | 5/5 | 8.270 ms | 8.371 ms |
-| n3 paused | 5/5 | 6.029 ms | 6.457 ms |
-| n3 killed | 5/5 | 5.828 ms | 7.641 ms |
+| Node | Versions during partition |
+| --- | --- |
+| n1 | Mumbai `{n1:2}` |
+| n2 | Pune `{n1:1,n2:1}` |
+| n3 | Both Mumbai and Pune |
 
-These small local samples demonstrate that the unavailable third node did
-not impose its two-second timeout on the client; the timing differences
-are normal variation, not evidence that failure improves performance.
-Milestone 2 required all peer successes and would return 503 for a failed
-peer. Milestone 3 can return 200 after the local write and one peer succeed.
-The historical Milestone 2 binary was not rerun for this measurement.
+n3 accepts both as concurrent siblings but does not forward internal PUTs.
+The script explicitly checks that n2 still has Delhi before creating Pune;
+thus n2 has not learned Mumbai's history through the third node.
 
-For the stale-replica check, all nodes first stored `old`. While n3 was
-down, n1 and n2 stored `fresh` with the same higher timestamp. After n3
-restarted, internal GETs confirmed `[fresh, fresh, old]`. All 15 external
-quorum GETs (five per coordinator) returned `fresh`. Internal GET on n3
-still returned `old` afterward, confirming selection without read repair.
-The script also prints peer timestamps and selected-timestamp log examples.
+Observed on 2026-10-08: both partitioned PUTs returned 200. After restoring
+both blocked links, all 15 quorum GETs (five through each coordinator)
+returned 300 with exactly those two versions and clocks. Every possible
+R=2 read set in this state contains both histories: either n1 and n2
+provide one each, or n3 provides both. This verifies the conflict response
+without relying on a favorable response order.
 
-## Learning note
+Internal GETs afterward confirmed the same local state as before the
+reads: reconnection and quorum reads did not repair missing siblings.
+The separate sequential key returned 200 with its second value through
+all three coordinators both before and after the partition (six checks).
+The script cleans up its servers, proxies, and temporary data on exit.
 
-The central Milestone 1 idea is the relationship between memory and
-durable storage:
-
--   The in-memory map makes ordinary reads fast.
--   The WAL records changes so state can be rebuilt after restart.
--   `Sync()` is used before acknowledging successful writes.
--   Recovery replays the log to reconstruct the map.
-
-Understanding these boundaries---especially what the system can and
-cannot promise when failures occur---is the foundation for the
-distributed milestone.
+Milestone 4 implementation and verification are complete, including the
+real three-node partition experiment.

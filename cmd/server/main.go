@@ -79,7 +79,7 @@ func main() {
 	kvStore := store.NewStore(*dataFile)
 	defer kvStore.Close()
 
-	handlers := api.NewHandler(kvStore, logger, peerList, *w, *r)
+	handlers := api.NewHandler(kvStore, logger, peerList, *w, *r, *id)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /kv/{key}", handlers.GetHandler)

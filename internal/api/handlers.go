@@ -6,7 +6,9 @@ import (
 	"errors"
 	"io"
 	"kvstore/internal/replication"
+	"kvstore/internal/vectorclock"
 	"log"
+	"math"
 	"net/http"
 	"sync"
 	"time"
@@ -15,11 +17,13 @@ import (
 )
 
 type Handler struct {
-	store  *store.Store
-	logger *log.Logger
-	peers  []string
-	w      int
-	r      int
+	nodeID  string
+	writeMu sync.Mutex // Serializes local clock creation with incoming peer writes.
+	store   *store.Store
+	logger  *log.Logger
+	peers   []string
+	w       int
+	r       int
 }
 
 type replicationFailure struct {
@@ -32,20 +36,18 @@ type replicationResponse struct {
 	Failed     []replicationFailure `json:"failed"`
 }
 
-type internalGetResponse struct {
-	Value  string `json:"value"`
-	Ts     int64  `json:"ts"`
-	Exists bool   `json:"exists"`
-}
-
-// Pointers distinguish missing/null fields from an empty value or timestamp zero.
+// Value is a pointer so an empty string is distinct from an absent field.
 type internalPutRequest struct {
-	Value *string `json:"value"`
-	Ts    *int64  `json:"ts"`
+	Value *string                 `json:"value"`
+	VC    vectorclock.VectorClock `json:"vc"`
 }
 
-func NewHandler(s *store.Store, logger *log.Logger, peers []string, w, r int) *Handler {
+func NewHandler(s *store.Store, logger *log.Logger, peers []string, w, r int, nodeID string) *Handler {
+	if nodeID == "" {
+		panic("handler requires a node ID")
+	}
 	return &Handler{
+		nodeID: nodeID,
 		store:  s,
 		logger: logger,
 		peers:  peers,
@@ -58,7 +60,7 @@ func (h *Handler) GetHandler(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	h.logger.Printf("GET key=%q", key)
 
-	value, ts, exists, err := h.store.GetWithMeta(key)
+	versions, err := h.store.GetSiblings(key)
 	if err != nil {
 		http.Error(w, "store is unhealthy", http.StatusInternalServerError)
 		return
@@ -77,7 +79,7 @@ func (h *Handler) GetHandler(w http.ResponseWriter, r *http.Request) {
 				if result.Err != nil {
 					h.logger.Printf("read key=%q -> %s FAILED (%s): %v", key, result.Peer, result.Latency, result.Err)
 				} else {
-					h.logger.Printf("read key=%q -> %s OK (%s) ts=%d exists=%t", key, result.Peer, result.Latency, result.Ts, result.Exists)
+					h.logger.Printf("read key=%q -> %s OK (%s) clocks=%v", key, result.Peer, result.Latency, clockSummary(result.Versions))
 				}
 				logged <- result
 			}
@@ -89,8 +91,8 @@ func (h *Handler) GetHandler(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			answers++
-			if result.Exists && (!exists || result.Ts > ts) {
-				value, ts, exists = result.Value, result.Ts, true
+			for _, version := range result.Versions {
+				versions = append(versions, store.Entry{Value: version.Value, VC: version.VC})
 			}
 			if answers >= h.r {
 				break
@@ -102,30 +104,57 @@ func (h *Handler) GetHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "read quorum not reached", http.StatusServiceUnavailable)
 		return
 	}
-	h.logger.Printf("READ quorum reached key=%q answers=%d R=%d selected_ts=%d exists=%t", key, answers, h.r, ts, exists)
-	if !exists {
+	survivors, err := store.Reconcile(versions)
+	if err != nil {
+		h.logger.Printf("READ inconsistent clocks key=%q: %v", key, err)
+		http.Error(w, "inconsistent version metadata", http.StatusBadGateway)
+		return
+	}
+	h.logger.Printf("READ quorum reached key=%q answers=%d R=%d clocks=%v", key, answers, h.r, clockSummary(toWire(survivors)))
+	if len(survivors) == 0 {
 		http.NotFound(w, r)
 		return
 	}
+	if len(survivors) > 1 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusMultipleChoices)
+		if err := json.NewEncoder(w).Encode(toWire(survivors)); err != nil {
+			h.logger.Printf("failed to encode conflict: %v", err)
+		}
+		return
+	}
+	w.Write([]byte(survivors[0].Value))
+}
 
-	w.Write([]byte(value))
+// clockSummary logs causal metadata without logging user values.
+func clockSummary(versions []replication.Version) []vectorclock.VectorClock {
+	clocks := make([]vectorclock.VectorClock, 0, len(versions))
+	for _, version := range versions {
+		clocks = append(clocks, version.VC)
+	}
+	return clocks
+}
+
+// toWire excludes node-local storage timestamps from the peer protocol.
+func toWire(entries []store.Entry) []replication.Version {
+	result := make([]replication.Version, 0, len(entries))
+	for _, entry := range entries {
+		result = append(result, replication.Version{Value: entry.Value, VC: vectorclock.Merge(entry.VC, nil)})
+	}
+	return result
 }
 
 func (h *Handler) InternalGetHandler(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	h.logger.Printf("INTERNAL GET key=%q", key)
 
-	value, ts, exists, err := h.store.GetWithMeta(key)
+	versions, err := h.store.GetSiblings(key)
 	if err != nil {
 		http.Error(w, "store is unhealthy", http.StatusInternalServerError)
 		return
 	}
 
-	response := internalGetResponse{
-		Value:  value,
-		Ts:     ts,
-		Exists: exists,
-	}
+	response := toWire(versions)
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		h.logger.Printf("failed to encode internal GET response: %v", err)
@@ -152,10 +181,9 @@ func (h *Handler) PutHandler(w http.ResponseWriter, r *http.Request) {
 
 	value := string(body)
 
-	// Generate once so the local write and every replica use the same timestamp.
-	ts := time.Now().UnixNano()
-	err = h.store.PutAt(key, value, ts)
+	vc, err := h.coordinateWrite(key, value)
 	if err != nil {
+		h.logger.Printf("local PUT failed key=%q: %v", key, err)
 		http.Error(w, "failed to store value", http.StatusInternalServerError)
 		return
 	}
@@ -168,7 +196,7 @@ func (h *Handler) PutHandler(w http.ResponseWriter, r *http.Request) {
 		h.peers,
 		key,
 		value,
-		ts,
+		vc,
 	)
 
 	var mu sync.Mutex
@@ -218,16 +246,42 @@ func (h *Handler) PutHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	mu.Unlock()
 	if acks >= h.w {
-		h.logger.Printf("WRITE quorum reached key=%q acks=%d W=%d ts=%d", key, acks, h.w, ts)
+		h.logger.Printf("WRITE quorum reached key=%q acks=%d W=%d vc=%v", key, acks, h.w, vc)
 		w.Write([]byte("OK"))
 		return
 	}
-	h.logger.Printf("WRITE quorum not reached key=%q acks=%d W=%d ts=%d", key, acks, h.w, ts)
+	h.logger.Printf("WRITE quorum not reached key=%q acks=%d W=%d vc=%v", key, acks, h.w, vc)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusServiceUnavailable)
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		h.logger.Printf("failed to encode replication response: %v", err)
 	}
+}
+
+// coordinateWrite keeps read/join/increment/store together for this node.
+// The same mutex also guards internal PUTs, but no network call holds it.
+func (h *Handler) coordinateWrite(key, value string) (vectorclock.VectorClock, error) {
+	h.writeMu.Lock()
+	defer h.writeMu.Unlock()
+	siblings, err := h.store.GetSiblings(key)
+	if err != nil {
+		return nil, err
+	}
+	vc := make(vectorclock.VectorClock)
+	for _, sibling := range siblings {
+		vc = vectorclock.Merge(vc, sibling.VC)
+	}
+	if vc[h.nodeID] == math.MaxInt64 {
+		return nil, errors.New("vector clock counter exhausted")
+	}
+	vc[h.nodeID]++
+	if err := replication.ValidateVersion(replication.Version{Value: value, VC: vc}); err != nil {
+		return nil, err
+	}
+	if _, err := h.store.PutWithClock(key, value, vc); err != nil {
+		return nil, err
+	}
+	return vc, nil
 }
 
 func (h *Handler) InternalPutHandler(w http.ResponseWriter, r *http.Request) {
@@ -236,7 +290,7 @@ func (h *Handler) InternalPutHandler(w http.ResponseWriter, r *http.Request) {
 
 	// JSON can expand a byte into six characters (for example, \u0000).
 	// Allow encoding overhead, then enforce the 1 MiB decoded-value limit.
-	r.Body = http.MaxBytesReader(w, r.Body, 6*(1<<20)+1024)
+	r.Body = http.MaxBytesReader(w, r.Body, replication.MaxWriteBytes)
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -255,8 +309,8 @@ func (h *Handler) InternalPutHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid replication JSON", http.StatusBadRequest)
 		return
 	}
-	if write.Value == nil || write.Ts == nil {
-		http.Error(w, "value and ts are required", http.StatusBadRequest)
+	if write.Value == nil || write.VC == nil {
+		http.Error(w, "value and vc are required", http.StatusBadRequest)
 		return
 	}
 	if len(*write.Value) > 1<<20 {
@@ -264,10 +318,23 @@ func (h *Handler) InternalPutHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Preserve the coordinator's timestamp when storing the replicated value.
-	// IMPORTANT: this handler never forwards the write to peers
-	if err := h.store.PutAt(key, *write.Value, *write.Ts); err != nil {
-		http.Error(w, "failed to store value", http.StatusInternalServerError)
+	if err := replication.ValidateVersion(replication.Version{Value: *write.Value, VC: write.VC}); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	// Store the coordinator's clock unchanged, without forwarding or incrementing.
+	// A stale version is acknowledged without changing state; a concurrent
+	// version is retained as a sibling. Milestone 3's timestamp ordering could
+	// ignore older timestamps, but could not detect and preserve concurrency.
+	h.writeMu.Lock()
+	_, err = h.store.PutWithClock(key, *write.Value, write.VC)
+	h.writeMu.Unlock()
+	if err != nil {
+		if errors.Is(err, store.ErrClockCollision) {
+			http.Error(w, err.Error(), http.StatusConflict)
+		} else {
+			http.Error(w, "failed to store value", http.StatusInternalServerError)
+		}
 		return
 	}
 

@@ -66,7 +66,12 @@ def main():
         def metadata(node, key):
             status, body, _ = request(node, f"/internal/kv/{key}")
             assert status == 200, (node, status, body)
-            return json.loads(body)
+            versions = json.loads(body)
+            assert isinstance(versions, list), versions
+            if not versions:
+                return {"value": "", "vc": {}}
+            assert len(versions) == 1, versions
+            return versions[0]
 
         def wait_value(node, key, value):
             deadline = time.monotonic() + 4
@@ -115,7 +120,7 @@ def main():
             start(2)
             before = [metadata(node, "gap") for node in range(3)]
             assert [item["value"] for item in before] == ["fresh", "fresh", "old"], before
-            assert before[0]["ts"] == before[1]["ts"] > before[2]["ts"], before
+            assert before[0]["vc"] == before[1]["vc"] and before[0]["vc"]["n1"] > before[2]["vc"]["n1"], before
             print("local versions before quorum reads: " + json.dumps(before), flush=True)
             for node in range(3):
                 for _ in range(5):
