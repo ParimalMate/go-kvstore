@@ -2,11 +2,11 @@
 
 An educational distributed key-value store with durable per-node write-ahead
 logs, concurrent replication, configurable read/write quorums, and vector
-clocks for detecting conflicting versions.
+clocks for detecting conflicting versions, and background gossip failure detection.
 
-**Project status:** Milestones 1–4 are implemented and verified. Milestone 4
-preserves concurrent versions as siblings and returns them with HTTP 300
-Multiple Choices. Gossip membership is the next milestone; background
+**Project status:** Milestones 1–5 are implemented and verified. Concurrent
+versions are preserved as siblings and returned with HTTP 300 Multiple Choices.
+Gossip tracks node liveness independently of quorum operations. Background
 anti-entropy and automatic replica repair are not implemented yet.
 
 All nodes in a cluster must use the current vector-clock protocol. Do not
@@ -28,6 +28,7 @@ with the current binary. Existing old WALs are rejected without alteration.
 - [Limitations](#limitations)
 - [Milestone history](#milestone-history)
 - [Vector clocks and conflict detection](#vector-clocks-and-conflict-detection)
+- [Gossip membership and failure detection](#gossip-membership-and-failure-detection)
 
 ## Overview
 
@@ -59,6 +60,7 @@ node IDs and list each actual peer once, consistently across the cluster.
 - Store health checks after write or sync failures.
 - Locks protecting the store and coordinator clock creation.
 - Signal-driven HTTP shutdown and independent two-second replication attempts.
+- Background push-pull gossip, restart detection and a local membership endpoint.
 - Unit tests, race-detector tests, and real-process cluster verification scripts.
 
 ## Architecture
@@ -156,8 +158,8 @@ if those contain Milestone 3 data, preserve them and use the explicit fresh
 paths above instead.
 
 Two nodes with no configured peers and W=R=1 are independent stores. Nodes
-replicate only to the peers explicitly listed; automatic discovery/gossip
-is not implemented yet.
+replicate only to the peers explicitly listed. Gossip can learn node IDs
+indirectly but does not discover or dial new addresses outside the seed list.
 
 ## HTTP API
 
@@ -267,6 +269,7 @@ Run real-process checks:
 bash checkpoint.sh
 python3 scripts/check-quorum-cluster.py
 python3 scripts/check-vectorclock-cluster.py
+python3 scripts/check-gossip-cluster.py
 ```
 
 `checkpoint.sh` runs two intentionally independent W=R=1 nodes on ports
@@ -283,7 +286,11 @@ proxies and verifies both concurrent versions survive quorum reads.
   Sequential writes through different coordinators can appear concurrent
   if the second coordinator has not learned the first write.
 - No read repair, anti-entropy, or automatic catch-up after a missed write.
-- Static peer membership; gossip/discovery is not implemented yet.
+- Static peer addresses: gossip learns IDs but does not discover new dialable
+  addresses or change quorum membership. Liveness is observational only.
+- Gossip thresholds assume a small cluster and sufficient network/scheduling
+  margin; packet delays and partitions can cause false suspicions. There is no
+  synchronized or authoritative cluster-wide alive/dead verdict.
 - No leader election, consensus, or claim of linearizable operations.
 - No authentication, authorization, or TLS; peer endpoints are not protected.
 - No WAL compaction/rotation; recovery reads the WAL into memory.
@@ -308,6 +315,7 @@ context or automatically choose among concurrent application values.
 | 2 | Concurrent peer replication, internal writes, failure logging |
 | 3 | W/R quorums, early write responses, timestamp-based version selection |
 | 4 | Vector clocks, sibling retention, cross-replica pruning, HTTP 300 conflicts |
+| 5 | Gossip heartbeat evidence, local failure detection, restart/identity handling |
 
 Milestone 3's last-write-wins timestamp policy could silently discard
 independent updates. The current implementation instead preserves concurrent
@@ -519,3 +527,218 @@ The script cleans up its servers, proxies, and temporary data on exit.
 
 Milestone 4 implementation and verification are complete, including the
 real three-node partition experiment.
+
+## Milestone 5 preparation (complete)
+
+The starting baseline is the `milestone-4` tag (`cc8873c`). On 2026-10-09,
+`go test -race -count=1 ./...`, `bash checkpoint.sh`, and both cluster scripts
+passed before creating the `milestone-5` branch.
+
+Startup validation now lives in `cmd/server/config.go`, with table-driven
+tests in `config_test.go`. Invalid configuration exits before opening the
+WAL or starting the server. Node IDs must match
+`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`. Validation also checks numeric ports,
+peer address syntax, duplicate peer addresses, local self-peers, quorum
+bounds, and `W+R>N`. Self-peer detection covers localhost, loopback and
+wildcard addresses at the listening port; it does not resolve DNS aliases.
+
+Three duration flags are accepted and validated:
+
+| Flag | Default | Rule |
+| --- | --- | --- |
+| `--gossip-interval` | `1s` | From `10ms` through `1m` |
+| `--suspect-after` | `10s` | At least three gossip intervals |
+| `--dead-after` | `20s` | Greater than suspect-after |
+
+These flags configure the running gossip service. Gossip observes liveness;
+it does not change quorum membership or replication behavior.
+
+The directed proxies in `scripts/check-vectorclock-cluster.py` now forward
+POST as well as GET and PUT. A blocked link returns 503 for all three.
+`scripts/check-quorum-cluster.py` uses direct peer connections, not proxies.
+Run `python3 scripts/test_gossip_proxy.py` to verify POST forwarding,
+blocking without delivery, and delivery after a link is restored.
+
+The standalone `internal/gossip` package now implements the evidence table
+and wire message types. `NewTable` validates its arguments and inserts self
+with heartbeat zero. `Merge` accepts strictly newer (generation, heartbeat)
+evidence, skips invalid entries, caps membership at 256 including self, and
+returns changes for the caller to log after unlocking. Self evidence is never
+adopted; a higher incoming self generation reports an ID conflict.
+
+`Beat` advances self, `Refresh` reports locally derived status transitions,
+and `Digest` returns a sorted independent copy for exchange. Refresh reports
+recovery exactly once as well: Merge updates observation time without erasing
+the previous status used for transition detection. Every time-dependent table
+operation uses an injected clock. With a normal `time.Now` clock, subtraction
+preserves Go's monotonic elapsed-time behavior. No remote timestamps or remote
+liveness verdicts are exchanged.
+
+Generation will be chosen from wall-clock Unix nanoseconds at process startup;
+a backwards wall-clock jump between restarts can produce a generation peers
+reject as stale. Unknown entries relayed from stale tables initially appear
+alive for one suspect-after window (a ghost period), then age toward dead
+unless newer evidence arrives. Entries are never deleted.
+
+Wire validation checks sender/member IDs, positive generations, nonnegative
+heartbeats, duplicate IDs and the 256-member limit. The exchange handler enforces
+the 64 KiB body limit. Integer decoding
+rejects fractions and overflowing numbers.
+
+`NoteDirect(id, addr)` records the identity returned by a successful validated
+exchange at the address actually dialed, including test proxy addresses. The
+last answer for an address wins, and each member's `via` holds its latest direct
+address. This local bookkeeping does not refresh heartbeat observation times
+and is never gossiped. Learning an ID second-hand does not match it to a seed.
+`MarkSelfAlias` excludes an address discovered to point back to this process.
+
+`SelectPeer` uses an injected random-index function (such as `rand.Intn`) to
+choose one configured address uniformly, excluding self-aliases. Dead and
+unreached peers remain eligible. With no eligible addresses it returns no peer.
+The caller's random function executes outside the table lock.
+
+`View(seeds)` returns sorted member snapshots with status, generation, heartbeat,
+`last_change_ms_ago`, and `via`, plus `unreached_seeds` for addresses not yet
+matched to an ID. It derives status using the current local time without
+consuming the transitions reported by Refresh. Returned slices are independent
+copies. Neither View nor seed selection removes dead members.
+
+Fake-clock tests cover comparison rules, exact age boundaries, restart and
+recovery, self protection, capacity and snapshot independence. A 50-goroutine
+test exercises Merge, Beat, Refresh, Digest, View and seed bookkeeping/selection
+together under the race detector. Deterministic selection tests cover every
+eligible index, dead peers, self-aliases and an empty candidate list.
+
+All eight preparation items are complete. Nothing in the data path consults
+this table.
+
+## Gossip membership and failure detection
+
+`internal/gossip.Service` owns the HTTP handlers and exchange client.
+`RegisterRoutes` installs Go 1.22 method patterns for
+`POST /internal/gossip` and `GET /internal/members`. They are tested on local
+HTTP servers and are now registered in the application server alongside the
+existing key/value routes.
+
+An exchange validates the complete body before merging. Oversized requests
+return 413; malformed or invalid messages return 400. The sender must include
+its own member entry, which supplies its generation for identity checks.
+Successful responses contain the responder's digest after merging. The members
+endpoint refreshes status, puts self first, and includes top-level `self` and
+`generation`, member details and unreached seeds.
+
+The dedicated exchange client uses a timeout of the gossip interval clamped to
+200ms through 2s. It requires status 200 and a valid response no larger than
+64 KiB before changing evidence or direct-address bookkeeping. Valid bodies
+are consumed through EOF; oversized streams are closed rather than drained
+without a bound. Redirects are not followed. Seed failures are logged initially
+and then only on reachability changes, not on every failed attempt.
+
+Same-ID responses with the same generation mark a self-alias; different
+generations report an ID conflict on both sides without replacing self state.
+Conflict logs are throttled to once per offending generation per 30 seconds.
+This assumes process generations differ: equal timestamp-derived generations
+for two processes with the same ID cannot be distinguished from an alias.
+
+HTTP tests cover push-pull, validation and limits, status views, method rejection,
+seed failure/recovery logging, both directions of duplicate-ID detection,
+self-alias handling and cancellation/timeouts.
+
+`main` captures the process generation once, creates the table and service after
+the store, and starts gossip after launching the HTTP server goroutine. With
+configured seeds, Start runs a round immediately and then on each interval:
+Beat, Refresh, select one seed, launch an exchange in a tracked goroutine.
+A slow peer cannot hold up future rounds. Without seeds no loop is started;
+standalone key/value behavior is unchanged and membership endpoints still work.
+
+Stop cancels the loop and its requests and waits for all outgoing workers. It
+is idempotent, safe with concurrent lifecycle calls, and runs before HTTP
+shutdown and store closure. A stopped Service is not restarted; a process
+restart constructs a new instance. Status transitions are logged once per
+detected change, and `OnChange` optionally receives each transition outside
+table and service locks. Hooks must return promptly and enqueue repair work;
+they must not synchronously call Stop on the notifying worker. No hook is
+registered by the application yet.
+
+Lifecycle tests cover continued heartbeats and aging during stalled exchanges,
+prompt cancellation, repeated/concurrent Stop calls, parent cancellation and
+standalone behavior.
+
+The multi-node HTTP harness reserves all addresses before wiring services and
+can replace a handler at the same address. It uses 50ms rounds, 400ms suspect
+and 800ms dead thresholds, with polling deadlines rather than fixed startup
+sleeps. Scenarios cover:
+
+- Three-node convergence and increasing heartbeat evidence.
+- A stopped node returning 503, with exactly one alive-to-suspect and one
+  suspect-to-dead callback on each surviving observer.
+- Restart at the same address after the old heartbeat exceeded 20, accepting
+  a newer generation with a lower heartbeat and reporting recovery.
+- Indirect liveness over n1-to-n2-to-n3, with no direct n1-to-n3 seed or `via`.
+- Loss of that middle node, aging of the disconnected nodes, and recovery
+  after the middle node restarts.
+- Five seconds of idle healthy operation with zero suspect transitions.
+- A self-alias contacted once and excluded from subsequent running rounds.
+
+Run these with `go test -race -count=5 ./internal/gossip`.
+
+### Protocol and local merge rules
+
+Each round exchanges a full digest with one uniformly random configured peer,
+including peers considered dead. The request and response have the same shape:
+
+```json
+{"from":"n1","members":[{"id":"n1","generation":1791000000000000000,"heartbeat":42}]}
+```
+
+Generation identifies one process lifetime; heartbeat increases each local
+round. Compare generation first, then heartbeat within a generation. A higher
+generation replaces older evidence even with a lower heartbeat. Equal or older
+evidence never refreshes the observation time. An unknown valid ID is inserted
+if the table has room (256 entries including self). Entries are never deleted.
+Self is never overwritten; differing directly observed self generations are
+reported as ID conflicts. Generation depends on wall-clock time at startup:
+clock regression across restarts may make fresh evidence look stale.
+
+Only evidence is shared, never another node's alive/dead verdict or observation
+timestamp. Each observer measures elapsed local monotonic time since newer
+evidence: age below suspect-after is alive, age below dead-after is suspect,
+otherwise dead. Self is always alive. Unknown stale entries learned indirectly
+have an initial ghost-alive window before they age out. These thresholds assume
+small N; large clusters require analysis of dissemination delay and tuning.
+Use suspect-after of at least eight round intervals when links may fail
+partially; the shipped default uses ten (1s rounds, 10s suspect, 20s dead).
+Random selection still probes unreachable peers, which can delay indirect
+evidence. A wider margin reduces false suspicions but cannot eliminate them.
+The validation floor remains three intervals, not a reliability recommendation.
+A future extension could favor recently reachable peers while still probing
+unreachable ones; this milestone retains uniform random selection.
+
+Inspect a running node with `curl localhost:8081/internal/members`. The response
+includes self and generation, self-first members with local status and age,
+the latest direct address (`via`), and configured addresses not yet matched to
+an ID (`unreached_seeds`). An empty `via` can mean the evidence was learned only
+indirectly. Endpoints are unauthenticated and intended for trusted test peers.
+Membership remains static: learning an unlisted ID does not discover its
+address or add it to peer selection, replication or quorum accounting.
+
+### Real-process verification
+
+`scripts/check-gossip-cluster.py` builds a temporary binary and starts three
+processes behind directed HTTP proxies, using 200ms rounds, 2s suspect and
+4s dead thresholds. It polls membership every 100ms and checks:
+
+- Initial convergence and kill-9 detection through suspect then dead within
+  dead-after plus 600ms (4.6s total).
+- Restart using the same ID and WAL, a higher generation and recovered data.
+- SIGSTOP/SIGCONT detection and recovery with the same generation.
+- Continued indirect liveness through n2 while n1/n3 links are blocked for
+  longer than dead-after; isolating n1 then makes it report both peers dead.
+- Recovery after healing, with continuous successful quorum PUT/GET probes
+  through a coordinator that retains two reachable replicas.
+
+The script resumes paused processes during cleanup and removes all temporary
+servers, proxies and files. Gossip does not repair missed data or resolve
+conflicts; no quorum or replication path consults the liveness table.
+
+Milestone 5 implementation and verification are complete.

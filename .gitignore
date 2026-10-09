@@ -13,6 +13,9 @@ data/
 # macOS
 .DS_Store
 
+# Python script bytecode
+__pycache__/
+
 # IDE
 .vscode/
 .idea/

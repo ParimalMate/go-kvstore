@@ -55,6 +55,7 @@ class Link:
 
             do_GET = forward
             do_PUT = forward
+            do_POST = forward
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
