@@ -4,10 +4,12 @@ An educational distributed key-value store with durable per-node write-ahead
 logs, concurrent replication, configurable read/write quorums, and vector
 clocks for detecting conflicting versions, and background gossip failure detection.
 
-**Project status:** Milestones 1–5 are implemented and verified. Concurrent
+**Project status:** Milestones 1–5 are complete. Milestone 6 preparation is
+reviewed; the anti-entropy implementation passes automated checks but remains
+work in progress pending independent review of its worker, cycles and endpoints. Concurrent
 versions are preserved as siblings and returned with HTTP 300 Multiple Choices.
 Gossip tracks node liveness independently of quorum operations. Background
-anti-entropy and automatic replica repair are not implemented yet.
+Merkle-tree anti-entropy repairs missing versions and preserves concurrent siblings.
 
 All nodes in a cluster must use the current vector-clock protocol. Do not
 mix Milestone 3 and Milestone 4 binaries or reuse timestamp-only WAL files
@@ -165,6 +167,13 @@ indirectly but does not discover or dial new addresses outside the seed list.
 
 The following examples target the three-node cluster above.
 
+Keys and values must be valid UTF-8 text; binary values are unsupported.
+Both PUT endpoints reject invalid UTF-8 with 400 before persistence. Valid
+Unicode, empty values, NUL and newline characters are supported and survive
+WAL replay. Internal PUT checks raw JSON bytes before decoding so invalid
+bytes cannot silently become replacement characters. The store also returns
+`ErrInvalidText` for invalid keys or values when called directly.
+
 ```bash
 curl -i -X PUT http://localhost:8081/kv/name --data-binary 'Parimal'
 curl -i http://localhost:8082/kv/name
@@ -270,6 +279,7 @@ bash checkpoint.sh
 python3 scripts/check-quorum-cluster.py
 python3 scripts/check-vectorclock-cluster.py
 python3 scripts/check-gossip-cluster.py
+python3 scripts/check-antientropy-cluster.py
 ```
 
 `checkpoint.sh` runs two intentionally independent W=R=1 nodes on ports
@@ -285,9 +295,10 @@ proxies and verifies both concurrent versions survive quorum reads.
 - No automatic conflict resolution or client-supplied causal context.
   Sequential writes through different coordinators can appear concurrent
   if the second coordinator has not learned the first write.
-- No read repair, anti-entropy, or automatic catch-up after a missed write.
+- No read repair or hinted handoff. Background anti-entropy repairs missed
+  versions; convergence still depends on reachable peers and completed cycles.
 - Static peer addresses: gossip learns IDs but does not discover new dialable
-  addresses or change quorum membership. Liveness is observational only.
+  addresses or change quorum membership. Liveness gates automatic repair selection but never quorum operations.
 - Gossip thresholds assume a small cluster and sufficient network/scheduling
   margin; packet delays and partitions can cause false suspicions. There is no
   synchronized or authoritative cluster-wide alive/dead verdict.
@@ -303,7 +314,7 @@ proxies and verifies both concurrent versions survive quorum reads.
 - Node IDs must be unique and retain their history across restarts. Reusing
   an ID after losing its WAL can cause clock collisions.
 
-This is a learning implementation, not a production database. Planned
+This is a learning implementation, not a production database. Background
 anti-entropy can deliver missing histories, but cannot invent client causal
 context or automatically choose among concurrent application values.
 
@@ -440,7 +451,7 @@ key, it creates `v2 {n3:1}`. A later quorum read can return 300 with both
 v1 and v2 even though the client submitted its writes sequentially. The
 server cannot infer that client-observed order from a plain value body.
 
-Planned Milestone 6 anti-entropy will eventually deliver missing versions,
+Milestone 6 anti-entropy delivers missing versions after successful repair,
 allowing a later write on a repaired coordinator to cover those histories.
 It does not automatically resolve existing concurrent siblings or guarantee
 that a coordinator is caught up at the moment of every new write. An
@@ -657,8 +668,8 @@ shutdown and store closure. A stopped Service is not restarted; a process
 restart constructs a new instance. Status transitions are logged once per
 detected change, and `OnChange` optionally receives each transition outside
 table and service locks. Hooks must return promptly and enqueue repair work;
-they must not synchronously call Stop on the notifying worker. No hook is
-registered by the application yet.
+they must not synchronously call Stop on the notifying worker. The application registers a non-blocking anti-entropy recovery hook when
+automatic repair is enabled.
 
 Lifecycle tests cover continued heartbeats and aging during stalled exchanges,
 prompt cancellation, repeated/concurrent Stop calls, parent cancellation and
@@ -742,3 +753,249 @@ servers, proxies and files. Gossip does not repair missed data or resolve
 conflicts; no quorum or replication path consults the liveness table.
 
 Milestone 5 implementation and verification are complete.
+
+## Milestone 6 preparation (complete)
+
+The clean starting baseline is `milestone-5` (`82b1d78`). The full race suite,
+checkpoint script, all three real-process cluster scripts and proxy test
+passed before creating `milestone-6` on 2026-10-10.
+
+The first preparation step closes the invalid-UTF-8 boundary hole. Previously,
+bytes `61 62 ff fe 63 64` could be accepted into memory but replayed from JSON
+as `61 62 ef bf bd ef bf bd 63 64`. New invalid-text writes are rejected before
+changing memory or the WAL. Existing data already coerced by JSON cannot have
+its original bytes recovered by this validation change.
+
+`internal/merkle` now provides canonical hashing and immutable trees independently
+of the store. Hashes use SHA-256 and big-endian fixed-width length prefixes:
+
+- A key's bucket is the first 12 bits of SHA-256(key), in 0..4095.
+- Clocks omit zero counters and sort IDs, encoding uint32 count followed by
+  uint16 ID byte length, ID bytes and uint64 counter per entry.
+- Versions encode uint32 value byte length, value bytes and canonical clock.
+  Siblings sort by clock bytes and then value bytes.
+- Key state hashes 0x02, uint32 key byte length, key bytes, uint32 sibling
+  count and the ordered versions. Timestamps are absent from the input type.
+- An empty leaf is 32 zero bytes; other leaves hash 0x00 followed by key-state
+  hashes in sorted key order. Internal nodes hash 0x01 and 16 child hashes.
+
+Every tree has levels 0 through 3: 1 root, 16 children, 256 intermediate nodes
+and 4096 leaf buckets. Shape never depends on which keys exist. A zero-value
+Builder accepts key/hash pairs (adding an existing key replaces its hash);
+Build makes an independent snapshot. Root, Node and Children return hashes by
+value, and BucketKeys returns a sorted copy. Invalid indexes return errors.
+`KeyDigest` names a listing entry because Go cannot use `KeyHash` for both
+the hashing function and a type in the same package.
+
+Tests lock three independently calculated golden key hashes and an empty-tree
+root; cover zero-counter normalization, sibling order, length boundaries and
+100,000-key bucket distribution; compare every node of two 10,000-key trees;
+and verify a one-key update changes exactly one hash at each level. Concurrent
+snapshot reads are checked under the race detector.
+
+Store now exposes `Revision()` and `Range(fn)`. Revision starts at 1 after
+startup replay and increments only after a durable write changes the sibling
+set. Stale writes, identical duplicates, invalid input, clock collisions and
+WAL failures do not advance it. This counter is local to the current Store
+instance; it is not persisted and is not a version to compare across replicas.
+
+Range visits every key once in unspecified order under the store lock, so a
+write cannot interleave with the scan. Its callback must be fast, must not call
+Store methods, and must not mutate or retain borrowed slices/maps. Callers must
+copy data they want to retain. Revision and Range are separate calls; the snapshot
+cache accounts for writes between them rather than assume one atomic call.
+
+Tests cover revision changes and replay, range coverage, concurrent scans and
+writes, and 20 deterministic randomized delivery sets applied to two stores in
+different orders with duplicate retries. Final sibling sets and canonical
+key hashes match, excluding informational timestamps. This convergence check
+assumes equal clocks carry equal values; clock collisions remain invalid input.
+
+`Handler.ApplyVersions` is now the shared remote-write path used by internal
+PUT and exposed through `antientropy.Applier`. It holds the same write mutex
+as the coordinator's read/join/increment/store sequence, validates each remote
+version and applies the existing dominance rule. The returned count measures
+versions that changed this key's state, not the number of removed siblings.
+On error it returns partial progress; earlier writes remain durable and the
+caller may continue with later versions in a subsequent call. Tests cover
+collision recovery, stale/duplicate counts and 50 goroutines mixing repairs
+with coordinator PUTs without losing clock increments or remote history.
+
+`Table.PeerByAddr` and `Table.AddrOf`, also exposed by Service, resolve directly
+observed peer identities and addresses. Status is derived at lookup time;
+lookups do not consume Refresh transitions. Unknown members, indirectly learned
+addresses and self aliases are not fabricated into repair targets. OnChange
+hooks must return promptly and only enqueue work, never run repair inline.
+
+`merkle.Compare` now walks only mismatching branches, requesting at most 256
+node hashes or 64 bucket listings per batch. Its Remote interface uses
+`Nodes(level, indexes) (NodeBatch, error)` and
+`Buckets(indexes) (map[int][]KeyDigest, error)`. NodeBatch includes fanout and
+levels as well as hashes: a bare hash slice cannot communicate a shape mismatch.
+Hashes are fixed 32-byte values; their JSON form is exactly 64 hexadecimal
+characters with strict decoding, so malformed hash lengths cannot be silently
+padded or truncated by Go's array decoder.
+
+After descent, bucket order is shuffled with an injectable index picker. The
+engine validates listing indexes, key placement and duplicate keys, sorts keys
+and recomputes each leaf. A listing that no longer matches the descended leaf
+is skipped as changed during comparison. Local-only, remote-only and differing
+keys are candidates, bounded by MaxKeys (default 1000, range 1..100000). Diff
+reports candidates, divergent/skipped buckets and truncation; Stats reports
+request/hash/bucket counts. No writes occur. A fake remote verifies identical
+trees require one hash and a single changed key among 10,000 requires 49 hashes.
+Malformed remote responses return errors rather than panics.
+
+The worker uses these validated flags:
+
+| Flag | Default | Validation |
+| --- | --- | --- |
+| `--ae-interval` | `30s` | `0` disables scheduling; otherwise `1s` through `1h` |
+| `--ae-max-keys` | `1000` | `1` through `100000` |
+| `--ae-initial-delay` | `5s` | Nonnegative; at most the interval when enabled |
+
+When scheduling is disabled, initial delay is ignored, so `--ae-interval 0`
+works without also overriding the default delay. The quorum, vector-clock and
+gossip cluster scripts explicitly disable anti-entropy to preserve their
+existing stale-replica and membership assertions while background repair is enabled in normal application runs.
+
+All eight preparation items are complete.
+
+## Milestone 6: Merkle-tree anti-entropy
+
+The first implementation batch adds `antientropy.SnapshotCache`, `TreeHandler`
+and `HTTPRemote`. The cache hashes key/version state inside Store.Range and
+builds an immutable tree. A cache mutex coalesces simultaneous stable-revision
+requests into one build. If revision changes across the scan/build, the result
+is still a consistent scan snapshot but is not cached under an uncertain
+revision; the next request can rebuild. This avoids retrying indefinitely
+under continuous writes. Callbacks only hash/add entries, without logging,
+networking or re-entering the store.
+
+TreeHandler registers POST `/internal/ae/nodes` and `/internal/ae/buckets`.
+Requests are capped at 64 KiB (413), with invalid JSON, missing fields,
+invalid levels/indexes, duplicate indexes and excess indexes returning 400.
+Node batches allow 1..256 indexes; bucket batches allow 1..64. Responses retain
+request order and always include fanout/levels. Buckets contain sorted key/hash
+pairs. Responses exceeding 8 MiB are rejected rather than truncated.
+
+HTTPRemote implements the pure comparison engine's Remote interface with a
+dedicated client, a 5s per-request timeout and an 8 MiB response cap. Valid
+bodies are consumed through EOF; oversized streams are closed without an
+unbounded drain. Redirects are refused. Non-200 responses become HTTPStatusError;
+invalid shape, counts, hash lengths, bucket order, duplicate/unsorted keys or
+wrong key placement become InvalidResponseError. Caller cancellation interrupts
+requests. Leaf-versus-listing verification remains the comparison engine's job.
+
+Tests cover real HTTP comparison, bounded request/response validation, typed
+errors, cancellation, 50 simultaneous cache callers, duplicate-write cache
+reuse and a write overlapping a scan.
+
+`antientropy.Service.SyncWith(ctx, peer)` now executes a bounded repair cycle.
+It compares a cached local tree, pulls peer-present candidate keys using the
+existing internal GET, and applies versions through Applier. If the resulting
+local state differs from the freshly pulled peer state, it pushes every local
+sibling through internal PUT. Local-only candidates are pushed directly.
+The comparison result retains validated peer hashes to distinguish local-only
+keys without additional listing requests. A pull's actual versions supersede
+the earlier tree hint when deciding whether a push is needed. Nothing is deleted.
+
+Each candidate consumes one key-budget slot even if it fails. Clock collisions
+are counted and logged once per key with local and remote clocks, without
+logging values or aborting other keys. Other key failures are counted and the
+cycle continues; network unreachability, cancellation and unavailable-peer
+statuses (502/503/504) stop that peer's cycle. A cycle uses its caller's context
+with a 60s maximum; requests use the dedicated 5s client. Existing sibling
+payload validation and the 64 MiB internal-read limit apply to key transfers;
+tree responses retain their separate 8 MiB limit.
+
+Report includes peer, start time, elapsed milliseconds, roots_equal,
+hashes_fetched, requests, buckets_diffed/skipped, keys_pulled/pushed,
+versions_applied, collisions, key_errors, truncated, roots_equal_after and error.
+Keys pulled count successful GETs; keys pushed count keys with at least one
+successful version PUT. Versions applied counts actual local state changes.
+Hashes fetched counts comparison hashes (at most 49 for a single-key branch);
+requests counts all HTTP attempts, including the final verification root.
+After any successful apply/push, a fresh revision-checked local tree and one
+remote root request verify convergence. A differing final root is reported,
+not treated as failure: writes may continue during a cycle. Equal-root cycles
+make exactly one request, fetch one hash and produce no cycle log line.
+
+Real-HTTP cycle tests cover missed writes, no-op WAL sizes, efficient descent,
+both-direction transfer, sibling preservation followed by conflict resolution,
+three budgeted cycles for 300 keys, collision/error isolation, lying/changing
+tree responses and caller cancellation. Worker triggers, operational endpoints
+and application wiring are implemented. The real-process cluster script also
+checks restart catch-up, conflict convergence and disabled scheduling.
+
+
+### Scheduling and operational endpoints
+
+One worker serializes repairs from a queue with 16 waiting slots. Requests for
+an already queued or active peer share that cycle. The periodic trigger first
+fires after `--ae-initial-delay`, then waits the interval with ±20% jitter. It
+chooses a configured peer at random, skipping known self aliases and peers that
+gossip currently reports suspect or dead; unknown peers remain eligible.
+A dead-to-alive gossip transition enqueues a repair without waiting for it.
+
+`POST /internal/ae/run` accepts `{"peer":"localhost:8082"}` to repair an explicit
+address regardless of its gossip status. An empty body or `{}` runs against all
+currently eligible configured peers sequentially. The response is an array of
+cycle reports, including errors for failed cycles. A full queue returns 429;
+a stopped worker returns 503. A disconnected caller stops waiting, while the
+worker retains ownership of the repair. If a multi-peer request encounters a
+full queue, earlier cycles in that request may already have completed.
+
+`GET /internal/ae/status` returns `totals` and `last_reports` keyed by peer.
+Totals include completed cycles, keys pulled/pushed, versions applied,
+collisions and failed cycles (`errors`). Returned status maps are copies.
+Equal-root cycles update counters without producing a log line.
+
+`--ae-interval 0` disables both automatic triggers. Tree endpoints and manual
+runs remain available. With no seeds there is no timer and an untargeted manual
+run returns an empty list. Shutdown cancels anti-entropy and waits for its worker,
+then stops gossip, shuts down HTTP, and finally closes the store. Quorum reads
+and writes do not consult gossip or wait for anti-entropy.
+
+
+### Verification and remaining limitations
+
+Run `python3 scripts/check-antientropy-cluster.py` to launch three real binaries
+with temporary WALs, dynamically allocated ports and directed HTTP proxies.
+It uses 2s repair rounds, a 1s initial delay, and gossip timings of 200ms/2s/4s.
+The script checks 20-key convergence and equal-root idle reports; kills n3,
+writes five new keys and overwrites two existing keys, then restarts n3 on its
+existing WAL and verifies all seven changes through local internal GETs.
+
+The conflict scenario blocks n1–n2 traffic while both can write through n3.
+Tree exchanges are briefly paused during conflict creation so repair cannot
+relay the first version before the second write. After healing, local internal
+GETs must show both siblings on every node without any quorum read driving
+repair. A resolving PUT through n1 then leaves one version everywhere. A
+separate run with `--ae-interval 0` confirms downtime gaps remain unrepaired.
+The older quorum, vector-clock and gossip scripts retain repair-disabled
+settings so their original assertions remain meaningful.
+
+- No deletes or tombstones, read repair, hinted handoff, or authentication.
+- A changed revision rebuilds the snapshot by scanning every key. Hashing and
+  sorting costs also depend on key/value sizes and sibling counts; this is not
+  an incremental tree updated at write time.
+- The shape is fixed at 4096 leaf buckets. Transfer happens per key/version,
+  not as byte-level patches. Large listings are bounded by the response cap.
+- A comparison is a hint across snapshots taken at different moments. Changed
+  bucket listings are skipped; later cycles retry. Concurrent writes can leave
+  final roots unequal without indicating an unsafe repair.
+- The key budget bounds candidates touched per cycle, not the number of bytes
+  transferred. Random bucket order avoids always favoring the same branches.
+- Repair narrows the stale-coordinator conflict-resolution limitation: once a
+  coordinator has learned all siblings, its next write can supersede them.
+  It does not guarantee catch-up before every write or provide client context.
+- A wiped node must not reuse its old ID before catching up. Reusing an ID with
+  lost causal history can create equal-clock/different-value collisions; repair
+  reports those collisions rather than choosing a value silently.
+
+Verification passed: `go test -race -count=5 ./internal/antientropy`,
+`go test -race -count=3 ./...`, a single-threaded anti-entropy race run,
+`go vet ./...`, `checkpoint.sh`, and all four real-process cluster scripts.
+Milestone 6 is recorded as work in progress. Its release tag is deferred until
+the worker, cycles and endpoints have completed independent review.

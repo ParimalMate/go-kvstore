@@ -84,7 +84,7 @@ def main():
                 outputs.append(output)
                 processes[node] = subprocess.Popen([
                     str(binary), "--id", f"n{node + 1}", "--port", str(ports[node]),
-                    "--data", str(work / f"n{node + 1}.wal"), "--w", "2", "--r", "2",
+                    "--data", str(work / f"n{node + 1}.wal"), "--w", "2", "--r", "2", "--ae-interval", "0",
                     "--peers", ",".join(links[node, peer].address for peer in range(3) if peer != node),
                     "--gossip-interval", "200ms", "--suspect-after", "2s", "--dead-after", "4s",
                 ], stdout=output, stderr=subprocess.STDOUT)

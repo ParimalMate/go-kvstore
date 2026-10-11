@@ -10,8 +10,10 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"reflect"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"kvstore/internal/store"
 )
@@ -180,6 +182,10 @@ func (h *Handler) PutHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	value := string(body)
+	if !utf8.ValidString(key) || !utf8.ValidString(value) {
+		http.Error(w, store.ErrInvalidText.Error(), http.StatusBadRequest)
+		return
+	}
 
 	vc, err := h.coordinateWrite(key, value)
 	if err != nil {
@@ -284,6 +290,33 @@ func (h *Handler) coordinateWrite(key, value string) (vectorclock.VectorClock, e
 	return vc, nil
 }
 
+// ApplyVersions serializes remote writes with coordinator read/join/increment.
+// It counts versions that change this key's state (not siblings removed). On an
+// error it returns the completed count; earlier writes remain durable. Callers
+// may continue with later versions in a subsequent call. No network I/O occurs.
+func (h *Handler) ApplyVersions(key string, versions []replication.Version) (changed int, err error) {
+	h.writeMu.Lock()
+	defer h.writeMu.Unlock()
+	current, err := h.store.GetSiblings(key)
+	if err != nil {
+		return 0, err
+	}
+	for _, version := range versions {
+		if err := replication.ValidateVersion(version); err != nil {
+			return changed, err
+		}
+		next, err := h.store.PutWithClock(key, version.Value, version.VC)
+		if err != nil {
+			return changed, err
+		}
+		if !reflect.DeepEqual(current, next) {
+			changed++
+		}
+		current = next
+	}
+	return changed, nil
+}
+
 func (h *Handler) InternalPutHandler(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	h.logger.Printf("INTERNAL PUT key=%q", key)
@@ -305,6 +338,11 @@ func (h *Handler) InternalPutHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var write internalPutRequest
+	// Reject invalid bytes before JSON decoding silently replaces them.
+	if !utf8.Valid(body) {
+		http.Error(w, store.ErrInvalidText.Error(), http.StatusBadRequest)
+		return
+	}
 	if err := json.Unmarshal(body, &write); err != nil {
 		http.Error(w, "invalid replication JSON", http.StatusBadRequest)
 		return
@@ -326,11 +364,11 @@ func (h *Handler) InternalPutHandler(w http.ResponseWriter, r *http.Request) {
 	// A stale version is acknowledged without changing state; a concurrent
 	// version is retained as a sibling. Milestone 3's timestamp ordering could
 	// ignore older timestamps, but could not detect and preserve concurrency.
-	h.writeMu.Lock()
-	_, err = h.store.PutWithClock(key, *write.Value, write.VC)
-	h.writeMu.Unlock()
+	_, err = h.ApplyVersions(key, []replication.Version{{Value: *write.Value, VC: write.VC}})
 	if err != nil {
-		if errors.Is(err, store.ErrClockCollision) {
+		if errors.Is(err, store.ErrInvalidText) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		} else if errors.Is(err, store.ErrClockCollision) {
 			http.Error(w, err.Error(), http.StatusConflict)
 		} else {
 			http.Error(w, "failed to store value", http.StatusInternalServerError)

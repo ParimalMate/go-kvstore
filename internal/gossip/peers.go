@@ -98,3 +98,39 @@ func (t *Table) View(seeds []string) LocalView {
 	sort.Strings(view.UnreachedSeeds)
 	return view
 }
+
+// PeerByAddr resolves a directly observed peer and derives its current status
+// without consuming Refresh transitions. Unknown identities and self aliases
+// are not reported as peers.
+func (t *Table) PeerByAddr(addr string) (id string, status Status, ok bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	id = t.direct[addr]
+	if id == "" || id == t.selfID || t.selfAliases[addr] {
+		return "", "", false
+	}
+	e := t.entries[id]
+	if e == nil {
+		return "", "", false
+	}
+	return id, t.statusAt(id, e, t.now()), true
+}
+
+// AddrOf returns the latest directly observed address; second-hand evidence
+// alone cannot supply an address. Self is never returned as a repair target.
+func (t *Table) AddrOf(id string) (addr string, ok bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	e := t.entries[id]
+	if id == t.selfID || e == nil || e.via == "" || t.selfAliases[e.via] || t.direct[e.via] != id {
+		return "", false
+	}
+	return e.via, true
+}
+
+// IsSelfAlias distinguishes a known self address from an unknown peer.
+func (t *Table) IsSelfAlias(addr string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.selfAliases[addr]
+}

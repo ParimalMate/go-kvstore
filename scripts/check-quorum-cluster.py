@@ -49,7 +49,7 @@ def main():
                 str(binary), "--id", f"n{node + 1}", "--port", str(ports[node]),
                 "--data", str(work / f"n{node + 1}.wal"),
                 "--peers", ",".join(f"127.0.0.1:{port}" for i, port in enumerate(ports) if i != node),
-                "--w", "2", "--r", "2",
+                "--w", "2", "--r", "2", "--ae-interval", "0",
             ], stdout=output, stderr=subprocess.STDOUT)
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:

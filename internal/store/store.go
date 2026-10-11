@@ -11,6 +11,7 @@ import (
 	"os"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // Entry is one sibling version. Ts is informational for clocked entries.
@@ -21,12 +22,14 @@ type Entry struct {
 }
 
 var ErrClockCollision = errors.New("equal vector clocks carry different values")
+var ErrInvalidText = errors.New("keys and values must be valid UTF-8 text")
 
 type Store struct {
-	data   map[string][]Entry
-	mu     sync.Mutex
-	log    *os.File
-	failed bool
+	data     map[string][]Entry
+	mu       sync.Mutex
+	log      *os.File
+	failed   bool
+	revision uint64
 }
 
 type record struct {
@@ -95,6 +98,8 @@ func NewStore(filePath string) *Store {
 	return &Store{
 		log:  file,
 		data: data,
+		// A process-local snapshot version, initialized once after replay.
+		revision: 1,
 	}
 }
 
@@ -153,6 +158,9 @@ func (s *Store) GetWithMeta(key string) (string, int64, bool, error) {
 // PutWithClock stores a version according to causal dominance, never timestamp order.
 // The returned siblings and their clocks are independent copies.
 func (s *Store) PutWithClock(key, value string, vc vectorclock.VectorClock) ([]Entry, error) {
+	if !utf8.ValidString(key) || !utf8.ValidString(value) {
+		return nil, ErrInvalidText
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.failed {
@@ -175,7 +183,28 @@ func (s *Store) PutWithClock(key, value string, vc vectorclock.VectorClock) ([]E
 		return nil, err
 	}
 	s.data[key] = next
+	s.revision++
 	return cloneEntries(next), nil
+}
+
+// Revision identifies the current in-process state for snapshot caching. It is
+// initialized once after replay and is not a durable or cross-node version.
+func (s *Store) Revision() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.revision
+}
+
+// Range visits every key once in unspecified order while holding the store lock.
+// fn must be fast, must not call back into Store (that would deadlock), and must
+// not modify or retain the borrowed versions slice or its vector-clock maps.
+// Copy any data needed after fn returns. A scan cannot interleave with a write.
+func (s *Store) Range(fn func(key string, versions []Entry)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, versions := range s.data {
+		fn(key, versions)
+	}
 }
 
 // GetSiblings returns all versions; an absent key returns an empty slice.

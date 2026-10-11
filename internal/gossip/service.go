@@ -208,3 +208,13 @@ func (s *Service) seedResult(seed string, err error) {
 		s.logger.Printf("gossip: seed %s reachable again", seed)
 	}
 }
+
+func (s *Service) PeerByAddr(addr string) (string, Status, bool) {
+	return s.table.PeerByAddr(addr)
+}
+
+func (s *Service) AddrOf(id string) (string, bool) {
+	return s.table.AddrOf(id)
+}
+
+func (s *Service) IsSelfAlias(addr string) bool { return s.table.IsSelfAlias(addr) }

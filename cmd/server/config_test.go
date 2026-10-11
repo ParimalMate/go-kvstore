@@ -91,3 +91,41 @@ func TestParsePeers(t *testing.T) {
 		}
 	}
 }
+
+func TestAntiEntropyConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(*config)
+		want   string
+	}{
+		{"defaults", func(c *config) {}, ""},
+		{"disabled default delay", func(c *config) { c.AEInterval = 0 }, ""},
+		{"negative interval", func(c *config) { c.AEInterval = -1 }, "--ae-interval"},
+		{"short interval", func(c *config) { c.AEInterval = time.Second - 1 }, "--ae-interval"},
+		{"long interval", func(c *config) { c.AEInterval = time.Hour + 1 }, "--ae-interval"},
+		{"minimum interval", func(c *config) { c.AEInterval = time.Second; c.AEInitialDelay = time.Second }, ""},
+		{"maximum interval", func(c *config) { c.AEInterval = time.Hour; c.AEInitialDelay = time.Hour }, ""},
+		{"no keys", func(c *config) { c.AEMaxKeys = 0 }, "--ae-max-keys"},
+		{"too many keys", func(c *config) { c.AEMaxKeys = 100001 }, "--ae-max-keys"},
+		{"one key", func(c *config) { c.AEMaxKeys = 1 }, ""},
+		{"max keys", func(c *config) { c.AEMaxKeys = 100000 }, ""},
+		{"negative delay", func(c *config) { c.AEInitialDelay = -1 }, "--ae-initial-delay"},
+		{"disabled negative delay", func(c *config) { c.AEInterval = 0; c.AEInitialDelay = -1 }, "--ae-initial-delay"},
+		{"excess delay", func(c *config) { c.AEInitialDelay = c.AEInterval + 1 }, "--ae-initial-delay"},
+		{"zero delay", func(c *config) { c.AEInitialDelay = 0 }, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := defaultConfig()
+			cfg.Peers = []string{"localhost:8081", "localhost:8082"}
+			tc.change(&cfg)
+			err := validateConfig(cfg)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("got %v want %s", err, tc.want)
+			}
+		})
+	}
+}

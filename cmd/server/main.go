@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"kvstore/internal/antientropy"
 	"kvstore/internal/api"
 	"kvstore/internal/gossip"
 	"kvstore/internal/store"
@@ -28,6 +29,9 @@ func main() {
 	flag.DurationVar(&cfg.GossipInterval, "gossip-interval", cfg.GossipInterval, "gossip round interval (10ms to 1m)")
 	flag.DurationVar(&cfg.SuspectAfter, "suspect-after", cfg.SuspectAfter, "suspect threshold (at least 3 gossip intervals)")
 	flag.DurationVar(&cfg.DeadAfter, "dead-after", cfg.DeadAfter, "dead threshold (greater than suspect threshold)")
+	flag.DurationVar(&cfg.AEInterval, "ae-interval", cfg.AEInterval, "anti-entropy interval (0 disables scheduling; otherwise 1s to 1h)")
+	flag.IntVar(&cfg.AEMaxKeys, "ae-max-keys", cfg.AEMaxKeys, "maximum candidate keys per anti-entropy cycle (1 to 100000)")
+	flag.DurationVar(&cfg.AEInitialDelay, "ae-initial-delay", cfg.AEInitialDelay, "initial anti-entropy delay (ignored when scheduling is disabled)")
 	flag.Parse()
 	cfg.Peers = parsePeers(rawPeers)
 	if err := validateConfig(cfg); err != nil {
@@ -52,12 +56,21 @@ func main() {
 
 	handlers := api.NewHandler(kvStore, logger, cfg.Peers, cfg.W, cfg.R, cfg.ID)
 
+	repairService, err := antientropy.NewService(kvStore, handlers, logger, cfg.AEMaxKeys, antientropy.Options{
+		Peers: cfg.Peers, Gossip: gossipService, Interval: cfg.AEInterval, InitialDelay: cfg.AEInitialDelay,
+	})
+	if err != nil {
+		logger.Fatalf("anti-entropy service failed: %v", err)
+	}
+	defer repairService.Stop()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /kv/{key}", handlers.GetHandler)
 	mux.HandleFunc("PUT /kv/{key}", handlers.PutHandler)
 	mux.HandleFunc("GET /internal/kv/{key}", handlers.InternalGetHandler)
 	mux.HandleFunc("PUT /internal/kv/{key}", handlers.InternalPutHandler)
 	gossipService.RegisterRoutes(mux)
+	repairService.RegisterRoutes(mux)
 
 	server := &http.Server{
 		Addr:    ":" + cfg.Port,
@@ -77,6 +90,7 @@ func main() {
 		errCh <- server.ListenAndServe()
 	}()
 	gossipService.Start(ctx)
+	repairService.Start(ctx)
 
 	logger.Printf("listening on port %s", cfg.Port)
 
@@ -85,6 +99,7 @@ func main() {
 		logger.Println("Shutdown signal received")
 
 	case err := <-errCh:
+		repairService.Stop()
 		gossipService.Stop()
 		if !errors.Is(err, http.ErrServerClosed) {
 			logger.Fatalf("HTTP server failed: %v", err)
@@ -92,6 +107,7 @@ func main() {
 		return
 	}
 
+	repairService.Stop()
 	gossipService.Stop()
 	shutdownCtx, cancel := context.WithTimeout(
 		context.Background(),

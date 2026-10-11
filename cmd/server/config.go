@@ -19,12 +19,16 @@ type config struct {
 	GossipInterval time.Duration
 	SuspectAfter   time.Duration
 	DeadAfter      time.Duration
+	AEInterval     time.Duration
+	AEMaxKeys      int
+	AEInitialDelay time.Duration
 }
 
 func defaultConfig() config {
 	return config{
 		ID: "n1", Port: "8080", DataFile: "kvlog", W: 2, R: 2,
 		GossipInterval: time.Second, SuspectAfter: 10 * time.Second, DeadAfter: 20 * time.Second,
+		AEInterval: 30 * time.Second, AEMaxKeys: 1000, AEInitialDelay: 5 * time.Second,
 	}
 }
 
@@ -87,6 +91,15 @@ func validateConfig(cfg config) error {
 	}
 	if cfg.DeadAfter <= cfg.SuspectAfter {
 		return fmt.Errorf("--dead-after must be greater than --suspect-after")
+	}
+	if cfg.AEInterval != 0 && (cfg.AEInterval < time.Second || cfg.AEInterval > time.Hour) {
+		return fmt.Errorf("--ae-interval must be 0 or between 1s and 1h")
+	}
+	if cfg.AEMaxKeys < 1 || cfg.AEMaxKeys > 100000 {
+		return fmt.Errorf("--ae-max-keys must be between 1 and 100000")
+	}
+	if cfg.AEInitialDelay < 0 || (cfg.AEInterval != 0 && cfg.AEInitialDelay > cfg.AEInterval) {
+		return fmt.Errorf("--ae-initial-delay must be nonnegative and no greater than the enabled interval")
 	}
 	return nil
 }
