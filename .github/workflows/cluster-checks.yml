@@ -1,0 +1,26 @@
+name: Cluster checks
+
+# Real multi-process scripts are timing sensitive, so they run on demand rather than on every push.
+on:
+  workflow_dispatch:
+
+jobs:
+  cluster:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Full verification
+        run: scripts/verify-all.sh
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-logs
+          path: |
+            verify-logs/
+            chaos-results/
