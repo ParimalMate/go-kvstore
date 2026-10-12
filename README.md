@@ -4,10 +4,11 @@ An educational distributed key-value store with durable per-node write-ahead
 logs, concurrent replication, configurable read/write quorums, and vector
 clocks for detecting conflicting versions, and background gossip failure detection.
 
-**Project status:** Milestones 1–5 are complete. Milestone 6 preparation is
-reviewed; the anti-entropy implementation passes automated checks but remains
-work in progress pending independent review of its worker, cycles and endpoints. Concurrent
-versions are preserved as siblings and returned with HTTP 300 Multiple Choices.
+**Project status:** Milestones 1–6 are implemented. Milestone 6 preparation has
+completed independent review; its worker, cycles and endpoints will receive
+independent review together with the Milestone 7 fault-injection harness.
+Concurrent versions are preserved as siblings and returned with HTTP 300
+Multiple Choices.
 Gossip tracks node liveness independently of quorum operations. Background
 Merkle-tree anti-entropy repairs missing versions and preserves concurrent siblings.
 
@@ -997,5 +998,20 @@ settings so their original assertions remain meaningful.
 Verification passed: `go test -race -count=5 ./internal/antientropy`,
 `go test -race -count=3 ./...`, a single-threaded anti-entropy race run,
 `go vet ./...`, `checkpoint.sh`, and all four real-process cluster scripts.
-Milestone 6 is recorded as work in progress. Its release tag is deferred until
-the worker, cycles and endpoints have completed independent review.
+Milestone 6 closeout verification on 2026-10-12 (macOS arm64) passed:
+
+- Five race-enabled runs of `./internal/antientropy`.
+- One race-enabled run with `GOMAXPROCS=1`.
+- Three consecutive runs of `scripts/check-antientropy-cluster.py`.
+- `go vet ./...`, anti-entropy formatting and diff whitespace checks.
+
+Coverage includes five-key catch-up, unchanged WALs on a one-hash no-op,
+2,000 shared keys plus one divergent key with at most 49 comparison hashes,
+concurrent sibling preservation and later resolution, bidirectional repair,
+three 100-key cycles for a 300-key gap, collision isolation, hostile peers,
+a recovery hook completing a cycle within 500ms, and cancellation of an
+in-flight cycle with repeated Stop calls within one second.
+
+The `milestone-6` tag records this implemented and tested checkpoint.
+Independent review of the worker, cycles and endpoints remains planned with
+Milestone 7; these automated results do not substitute for that review.
