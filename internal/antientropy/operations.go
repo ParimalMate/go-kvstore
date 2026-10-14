@@ -51,6 +51,17 @@ func (s *Service) HandleRun(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "peer must be host:port", 400)
 			return
 		}
+		configured := false
+		for _, peer := range s.worker.options.Peers {
+			if peer == request.Peer {
+				configured = true
+				break
+			}
+		}
+		if !configured {
+			http.Error(w, "peer must be a configured peer", http.StatusBadRequest)
+			return
+		}
 		peers = []string{request.Peer}
 	}
 	reports := make([]Report, 0, len(peers))

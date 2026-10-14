@@ -75,7 +75,7 @@ func TestWorkerQueueDedupAndStop(t *testing.T) {
 	}))
 	defer server.Close()
 	peer := strings.TrimPrefix(server.URL, "http://")
-	s := workerService(t, Options{})
+	s := workerService(t, Options{Peers: []string{peer, "overflow:1234"}})
 	s.Start(context.Background())
 	first, err := s.enqueue(peer)
 	if err != nil {
@@ -217,5 +217,35 @@ func TestWorkerTimerAndSelfAlias(t *testing.T) {
 	alias := workerService(t, Options{Peers: []string{peer}, Gossip: m})
 	if len(alias.eligiblePeers()) != 0 {
 		t.Fatal("self alias eligible")
+	}
+}
+
+func TestRunRejectsUnconfiguredPeer(t *testing.T) {
+	contacted := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case contacted <- struct{}{}:
+		default:
+		}
+		http.Error(w, "unexpected contact", 503)
+	}))
+	defer server.Close()
+	peer := strings.TrimPrefix(server.URL, "http://")
+	for _, peers := range [][]string{nil, {"localhost:1234"}} {
+		s := workerService(t, Options{Peers: peers})
+		s.Start(context.Background())
+		rr := httptest.NewRecorder()
+		s.HandleRun(rr, httptest.NewRequest("POST", "/internal/ae/run", strings.NewReader(`{"peer":"`+peer+`"}`)))
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("status %d, want 400", rr.Code)
+		}
+		if s.Status().Totals.Cycles != 0 {
+			t.Fatal("unconfigured peer was queued")
+		}
+		select {
+		case <-contacted:
+			t.Fatal("unconfigured peer contacted")
+		default:
+		}
 	}
 }

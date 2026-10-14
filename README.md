@@ -4,9 +4,9 @@ An educational distributed key-value store with durable per-node write-ahead
 logs, concurrent replication, configurable read/write quorums, and vector
 clocks for detecting conflicting versions, and background gossip failure detection.
 
-**Project status:** Milestones 1–6 are implemented. Milestone 6 preparation has
-completed independent review; its worker, cycles and endpoints will receive
-independent review together with the Milestone 7 fault-injection harness.
+**Project status:** Milestones 1–6 are implemented. Milestone 6 preparation,
+worker, cycles and endpoints have completed independent review. Milestone 7
+currently contains only the pure invariant checker and its tests.
 Concurrent versions are preserved as siblings and returned with HTTP 300
 Multiple Choices.
 Gossip tracks node liveness independently of quorum operations. Background
@@ -102,8 +102,8 @@ attempts continue. R=1 reads only local state.
 - Go compatible with the version declared in `go.mod`.
 - `curl` for examples and quorum timing checks.
 - Bash and POSIX signals for `checkpoint.sh` and cluster scripts.
-- Python 3 for the two real-cluster verification scripts; no third-party
-  Python packages are required.
+- Python 3.10 or newer for the invariant checker and verification scripts;
+  no third-party Python packages are required.
 
 ## Project structure
 
@@ -940,8 +940,9 @@ gossip currently reports suspect or dead; unknown peers remain eligible.
 A dead-to-alive gossip transition enqueues a repair without waiting for it.
 
 `POST /internal/ae/run` accepts `{"peer":"localhost:8082"}` to repair an explicit
-address regardless of its gossip status. An empty body or `{}` runs against all
-currently eligible configured peers sequentially. The response is an array of
+configured address regardless of its gossip status. Addresses must match a
+configured `--peers` entry exactly; other addresses return HTTP 400. An empty
+body or `{}` runs against all currently eligible configured peers sequentially. The response is an array of
 cycle reports, including errors for failed cycles. A full queue returns 429;
 a stopped worker returns 503. A disconnected caller stops waiting, while the
 worker retains ownership of the repair. If a multi-peer request encounters a
@@ -1013,5 +1014,5 @@ a recovery hook completing a cycle within 500ms, and cancellation of an
 in-flight cycle with repeated Stop calls within one second.
 
 The `milestone-6` tag records this implemented and tested checkpoint.
-Independent review of the worker, cycles and endpoints remains planned with
-Milestone 7; these automated results do not substitute for that review.
+Independent review of the worker, cycles and endpoints is complete. Manual
+repair requests now reject addresses outside configured `--peers` with HTTP 400.

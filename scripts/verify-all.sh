@@ -9,6 +9,7 @@ QUICK=0
 [ "${1:-}" = "--quick" ] && QUICK=1
 mkdir -p verify-logs
 failed=0
+skipped=0
 rows=()
 
 run() { # run <name> <command...>
@@ -40,10 +41,17 @@ if [ "$QUICK" -eq 0 ]; then
       run "chaos-seed-$seed" python3 scripts/chaos-cluster.py --seed "$seed" --duration 45
     done
   else
+    skipped=$((skipped + 1))
     echo "chaos-seeds                    SKIP  (scripts/chaos-cluster.py not implemented)"
   fi
 fi
 
 echo "------------------------------------------------"
-if [ "$failed" -eq 0 ]; then echo "ALL CHECKS PASSED"; else echo "SOME CHECKS FAILED (see verify-logs/)"; fi
+if [ "$failed" -ne 0 ]; then
+  echo "SOME CHECKS FAILED (see verify-logs/; $skipped skipped)"
+elif [ "$skipped" -gt 0 ]; then
+  echo "PASSED ($skipped skipped)"
+else
+  echo "ALL CHECKS PASSED"
+fi
 exit "$failed"
