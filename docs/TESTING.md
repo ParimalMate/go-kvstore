@@ -34,8 +34,8 @@ settles, and the harness checks:
 | Process health | whole run | No unexpected exit, no `panic`, no `fatal error`, no `DATA RACE`. |
 
 A write that times out or loses its connection is **indeterminate**: it may still apply later (for
-example a request stuck behind a paused node), so it is allowed to supersede an older acknowledged
-write. A write that received an explicit error status gets no such allowance.
+example a request stuck behind a paused node), so an older-sequence indeterminate attempt can explain a value arriving after
+a newer acknowledged write. A write that received an explicit error status gets no such allowance.
 
 ### What a seed replays
 
@@ -47,7 +47,9 @@ replayable schedule, not a deterministic simulation. If a seed fails, rerun it a
 ### Results
 
 `python3 scripts/chaos-matrix.py --seeds 1-10 --duration 60 > docs/chaos-results.md` runs the seeds and
-writes the table, with the machine, Go version and commit recorded automatically. Every number in it
+writes the table, with the machine, Go version and commit recorded automatically.
+See [the local 60-second matrix](chaos-results.md) and
+[the extended runs](chaos-extended-results.md). Every number in it
 comes from the harness's own `summary.json` files.
 
 ## How we know the harness can fail
@@ -55,7 +57,7 @@ comes from the harness's own `summary.json` files.
 A test that cannot fail proves nothing, so the harness is checked from three directions.
 
 1. **The checker is tested on fake histories.** `scripts/test_chaos_invariants.py` has 21 cases, one or
-   more per rule. Breaking the checker in ten different ways (never flag a lost write, drop the
+   more per rule. In the supplied independent review, breaking the checker in ten different ways (never flag a lost write, drop the
    indeterminate allowance, off-by-one on the floor, allow a 404 after an ack, stop normalizing zero
    clock entries, ignore GET 502, accept prefix-only value matches, count an ack that ended exactly at
    read start, skip the cross-node check, forget PUT 500) was caught by the tests every time.
@@ -74,7 +76,7 @@ A test that cannot fail proves nothing, so the harness is checked from three dir
      holds the missing data pushes it from its own cycle, so the same divergence is still repaired. The
      harness checks outcomes, not mechanisms, and this is an equivalent mutant.
 
-## Bugs found in the harness itself
+## Bugs found in the supplied harness review
 
 - The crash monitor reported a deliberate graceful stop as a crash: it read a node's state before its
   exit status, so a stop that began between the two reads looked like an unexpected exit. The state is now
@@ -88,3 +90,15 @@ A test that cannot fail proves nothing, so the harness is checked from three dir
 - Three nodes with `N=3, W=2, R=2` only; keys are small and each key has a single writer at a time.
 - Anti-entropy runs on a 2 s interval here so convergence is observable within a test; production
   defaults are slower.
+
+
+## Local verification record
+
+On 2026-10-17, the supplied harness was installed with the large-payload test
+fix. `scripts/verify-all.sh --quick` passed; the full verifier then passed all
+Go/Python checks, four cluster scripts, both negative controls and seeds 1–3
+at 45 seconds each, ending with `ALL CHECKS PASSED` (no skips).
+The 60-second matrix was run separately and its original summaries were kept
+in `chaos-results/matrix-60s/`, so verifier reruns did not overwrite that evidence.
+Control logs are in `verify-logs/chaos-control-no-repair.log` and
+`verify-logs/chaos-control-mutate.log`; these are local generated artifacts.
