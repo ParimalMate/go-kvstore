@@ -102,3 +102,7 @@ The 60-second matrix was run separately and its original summaries were kept
 in `chaos-results/matrix-60s/`, so verifier reruns did not overwrite that evidence.
 Control logs are in `verify-logs/chaos-control-no-repair.log` and
 `verify-logs/chaos-control-mutate.log`; these are local generated artifacts.
+
+The two additional 180-second runs (seeds 11 and 12) also completed with zero
+violations and identical restart replay. Performance measurements are recorded
+separately in [Benchmarks](BENCHMARKS.md); no chaos workload ran during them.

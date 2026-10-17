@@ -185,6 +185,12 @@ The harness uses a **replayable fault schedule**, not deterministic execution.
 See [Testing](docs/TESTING.md) for invariants, failure controls and limitations,
 and [local results](docs/chaos-results.md) for measured seed outcomes.
 
+## Measurements
+
+[Loopback benchmark results](docs/BENCHMARKS.md) cover single-node and quorum
+latency, a paused-peer comparison, Merkle efficiency and restart catch-up.
+They record the hardware and methodology and are indicative, not production figures.
+
 ## Limits and further reading
 
 - No deletes/tombstones, transactions, authentication, TLS, read repair or hinted handoff.
