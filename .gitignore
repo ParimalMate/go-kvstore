@@ -35,3 +35,6 @@ verify-logs/
 /kvstore-final.zip
 /verify-all.txt
 /chaos-results-table.txt
+
+# Build output directory
+/bin/
