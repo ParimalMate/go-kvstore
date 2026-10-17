@@ -100,7 +100,10 @@ func TestWritePreservesCoordinatorClock(t *testing.T) {
 	h := NewHandler(origin, logger, peers, len(peers)+1, 1, "n1")
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /kv/{key}", h.PutHandler)
-	for index, value := range []string{"Parimal", "", "नमस्ते\n\"quoted\"", strings.Repeat("\x00", 1<<20)} {
+	// NULs are the worst case for JSON escaping (6 bytes each on the wire). A full 1 MiB of them
+	// is ~6 MB per peer and races the 2s replication deadline under the race detector on a slow
+	// machine, so escaping is covered at 64 KiB and the 1 MiB limit with a payload that does not expand.
+	for index, value := range []string{"Parimal", "", "नमस्ते\n\"quoted\"", strings.Repeat("\x00", 64<<10), strings.Repeat("x", 1<<20)} {
 		response := httptest.NewRecorder()
 		mux.ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/kv/name", strings.NewReader(value)))
 		if response.Code != http.StatusOK {
