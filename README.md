@@ -1,409 +1,205 @@
-# Persistent Key-Value Store in Go
+# Distributed Key-Value Store in Go
 
-A simple single-node key-value store built in Go. It exposes an HTTP API
-for storing and retrieving string values, keeps data in memory for fast
-access, and uses a Write-Ahead Log (WAL) to recover data after a
-restart.
+[![CI](https://github.com/ParimalMate/go-kvstore/actions/workflows/ci.yml/badge.svg)](https://github.com/ParimalMate/go-kvstore/actions/workflows/ci.yml)
 
-> **Project status:** Milestone 1 (single-node persistence) is
-> implemented. The project is a learning implementation and is not
-> intended to be a production database.
+An educational Dynamo-style replicated key-value store with a durable write-ahead
+log, configurable quorums, vector-clock conflict detection, gossip failure
+detection, and Merkle-tree anti-entropy. It preserves concurrent values instead
+of silently selecting a winner and repairs replicas that missed writes.
 
-## Contents
-
--   [Overview](#overview)
--   [Features](#features)
--   [Architecture](#architecture)
--   [Requirements](#requirements)
--   [Project structure](#project-structure)
--   [Build and run](#build-and-run)
--   [HTTP API](#http-api)
--   [Write-Ahead Log](#write-ahead-log)
--   [Concurrency and failures](#concurrency-and-failures)
--   [Testing](#testing)
--   [Automated checkpoints](#automated-checkpoints)
--   [Limitations](#limitations)
--   [Milestone 2 direction](#milestone-2-direction)
-
-## Overview
-
-The store maps string keys to string values. Data is held in an
-in-memory Go map and persisted to a local WAL file. When the server
-starts, it replays valid WAL records to reconstruct the map.
-
-The current implementation is a **single-node** store. Running two
-instances creates two independent stores when each instance uses a
-different port and WAL file. The instances do not replicate data to each
-other.
+Milestones 1–6 are implemented and independently reviewed. The Milestone 7
+fault-injection harness and its local results are described in
+[Testing](docs/TESTING.md) and the [seed matrix](docs/chaos-results.md).
+This is a learning project, not a production database.
 
 ## Features
 
--   HTTP endpoints to put and get key-value pairs.
--   In-memory map for reads.
--   JSON-encoded, newline-delimited WAL records.
--   WAL replay during startup.
--   `Sync()` before acknowledging a successful write.
--   Mutex-based synchronization for concurrent access.
--   Detection and truncation of an incomplete final WAL record.
--   Unhealthy-state handling after WAL write or sync failures.
--   Graceful shutdown on `SIGINT` and `SIGTERM`.
--   Configurable listening port and WAL path.
--   Unit tests, concurrency tests, and race-detector checks.
+- Durable local writes before replication; WAL replay after restart.
+- Concurrent fan-out with early replies after W successful writes.
+- Quorum reads across R responses, including the local node.
+- Vector-clock siblings and HTTP 300 for unresolved concurrent values.
+- Gossip heartbeat evidence and local alive/suspect/dead decisions.
+- Fixed-shape SHA-256 Merkle trees with 4096 leaf buckets.
+- Bounded background repair triggered by timers, recovery events, or an API call.
+- A real-process harness with replayable fault schedules and negative controls.
+- Go standard library only; Python verification scripts have no external dependencies.
 
 ## Architecture
 
-``` text
-                   HTTP request
-                        |
-                        v
-                 Go HTTP server
-                        |
-                        v
-                 Store methods
-                        |
-               +--------+--------+
-               |                 |
-               v                 v
-          In-memory map      WAL file
-            (data)        (append records)
-               ^                 |
-               |                 v
-               +---------- Sync()
+```mermaid
+flowchart LR
+    Client -->|PUT / GET| A[Coordinator]
+    A --> WAL[Local WAL and sibling store]
+    A -->|Concurrent replication and quorum reads| B[Peer B]
+    A -->|Concurrent replication and quorum reads| C[Peer C]
+    B <-->|Gossip evidence and Merkle repair| C
+    A <-->|Gossip evidence and Merkle repair| B
+    A <-->|Gossip evidence and Merkle repair| C
 ```
 
-A successful `PUT` follows this order:
-
-1.  Acquire the store mutex.
-2.  Reject the operation if the store is marked unhealthy.
-3.  Encode the operation as a WAL record.
-4.  Append the record to the WAL.
-5.  Call `Sync()` on the WAL file.
-6.  Update the in-memory map.
-7.  Return success.
-
-The ordering is important: the in-memory state is changed only after the
-WAL write and sync report success.
+All nodes have the same roles. The node receiving a client request becomes that
+request's coordinator. Peer membership is static: gossip learns identities but
+does not discover new dialable addresses or change quorum sizes.
 
 ## Requirements
 
--   Go installed and available on `PATH`.
--   `curl` for the HTTP examples and checkpoint script.
--   A Unix-like shell (such as macOS Terminal, Linux shell, or the VS
-    Code integrated terminal) to run `checkpoint.sh`.
+- Go 1.22 or newer.
+- Python 3.10 or newer for the verification scripts.
+- Bash, curl, and POSIX signals for cluster scripts (macOS/Linux).
+- A C toolchain supported by Go when using `-race`.
 
-Check your Go installation:
+## Quick start
 
-``` bash
-go version
+From a fresh checkout, build and start the three-node cluster:
+
+```bash
+go build ./...
+bash run-cluster.sh
 ```
 
-## Project structure
+Keep that terminal open. The launcher uses ports 8081–8083, W=2/R=2, and
+separate `n1.log`, `n2.log`, `n3.log` WALs. Operational logs go to `n1.out`,
+`n2.out`, and `n3.out`. Existing WALs are replayed; use a fresh directory for
+these examples. In another terminal:
 
-The exact structure may vary as the project evolves. A typical layout
-is:
-
-``` text
-kvstore/
-├── main.go
-├── store_test.go
-├── checkpoint.sh
-├── go.mod
-└── README.md
+```bash
+curl -i -X PUT http://localhost:8081/kv/greeting --data-binary 'hello'
+curl -i http://localhost:8082/kv/greeting
 ```
 
-WAL files are created at the path passed through the `-data` flag. The
-automated checkpoint script uses a temporary directory for its WAL and
-output log files and removes that directory when it exits.
+Expect HTTP 200 and `hello` from GET. To deliberately demonstrate a conflict,
+use the peer API to supply two concurrent clocks on the same node:
 
-## Build and run
-
-Run commands from the project directory---the directory containing
-`go.mod`.
-
-### Run with default settings
-
-``` bash
-go run .
+```bash
+curl -i -X PUT http://localhost:8081/internal/kv/demo-conflict \
+  -H 'Content-Type: application/json' \
+  --data-binary '{"value":"Mumbai","vc":{"demo-a":1}}'
+curl -i -X PUT http://localhost:8081/internal/kv/demo-conflict \
+  -H 'Content-Type: application/json' \
+  --data-binary '{"value":"Pune","vc":{"demo-b":1}}'
+curl -i http://localhost:8081/kv/demo-conflict
 ```
 
-If your `main.go` is the only entry point, `go run main.go` also works.
+GET returns HTTP 300 with both `{value, vc}` objects. This controlled example
+injects concurrent versions directly; the cluster and chaos scripts create
+conflicts using actual network partitions. Resolve through n1, which knows both:
 
-### Configure port and WAL file
-
-``` bash
-go run . -port 5001 -data store-a.log
+```bash
+curl -i -X PUT http://localhost:8081/kv/demo-conflict --data-binary 'Resolved'
+curl -i http://localhost:8081/kv/demo-conflict
 ```
 
--   `-port` selects the HTTP port.
--   `-data` selects the WAL file path.
+Expect one HTTP 200 value. Press Ctrl+C in the launcher terminal to stop all
+three processes. Keep each node's ID and WAL together when restarting.
 
-The WAL file is created if it does not already exist. Use a stable path
-if you want the data to be available after restarting the server.
+For an independent single node:
 
-### Run two independent instances
-
-Open two terminals in the project directory.
-
-Terminal 1:
-
-``` bash
-go run . -port 5001 -data store-a.log
+```bash
+go build -o server ./cmd/server
+./server --id solo --port 8080 --data solo.wal --w 1 --r 1
 ```
 
-Terminal 2:
+## API
 
-``` bash
-go run . -port 5002 -data store-b.log
-```
+Keys and values are UTF-8 text. Empty values, Unicode, NUL and newline are
+supported. Binary values are rejected. External PUT accepts up to 1 MiB.
 
-Each process has its own memory and WAL file. A write to one instance
-will not automatically appear in the other.
+| Method and path | Purpose / response |
+|---|---|
+| `PUT /kv/{key}` | Raw value; 200 once W durable acknowledgements arrive, 503 if quorum fails |
+| `GET /kv/{key}` | 200 plain value, 300 JSON siblings, 404 absent, 503 insufficient responses |
+| `PUT /internal/kv/{key}` | JSON `{value,vc}`; apply vector-clock dominance |
+| `GET /internal/kv/{key}` | Full sibling array, empty array for an absent key |
+| `POST /internal/gossip` | Push-pull `{from,members}` evidence |
+| `GET /internal/members` | Local liveness view and unreached seeds |
+| `POST /internal/ae/nodes` | Tree hashes at `{level,indexes}` |
+| `POST /internal/ae/buckets` | Key/hash listings at `{indexes}` |
+| `POST /internal/ae/run` | Optional `{peer}`; returns repair reports |
+| `GET /internal/ae/status` | Totals and last report per peer |
 
-**Important:** Do not run two instances against the same WAL file. This
-implementation is not designed for multiple processes to concurrently
-own one WAL.
+An explicit manual repair target must exactly match a configured `--peers`
+entry; other targets return 400. An empty body repairs currently eligible peers.
+Internal endpoints are unauthenticated and must not be exposed to untrusted
+clients. See [Protocols](docs/PROTOCOLS.md) for formats, limits and error cases.
 
-### Stop the server
+## Flags
 
-Press `Ctrl+C` in the terminal running the server. The application
-handles `os.Interrupt` and `SIGTERM` to initiate graceful shutdown.
+| Flag | Default | Meaning / constraints |
+|---|---|---|
+| `--id` | `n1` | Unique ID: 1–64 ASCII letters, digits, `.`, `_`, `-`; starts alphanumeric |
+| `--port` | `8080` | Numeric listening port |
+| `--data` | `kvlog` | Per-node WAL path |
+| `--peers` | empty | Comma-separated `host:port` addresses |
+| `--w` | `2` | Required write acknowledgements, including local |
+| `--r` | `2` | Required read responses, including local |
+| `--gossip-interval` | `1s` | 10ms–1m |
+| `--suspect-after` | `10s` | At least 3 intervals; allow more margin for partial failures |
+| `--dead-after` | `20s` | Greater than suspect threshold |
+| `--ae-interval` | `30s` | 0 disables automatic repair; otherwise 1s–1h |
+| `--ae-max-keys` | `1000` | 1–100000 candidate keys per cycle |
+| `--ae-initial-delay` | `5s` | 0–interval when enabled; ignored when disabled |
 
-## HTTP API
+N is `len(peers)+1`; startup requires `1 <= W,R <= N` and `W+R>N`.
+The common three-node configuration is W=2/R=2. With no peers, use W=R=1.
+Disabling automatic repair keeps tree endpoints and manual repair available.
 
-The examples below assume the handlers use the `/kv/{key}` route and a
-successful `PUT` returns HTTP `200`, as implemented in the project.
+## How it works
 
-### Put a value
+**WAL.** A node appends and syncs each changing write before exposing it in
+memory. Replay uses the same dominance rule as live traffic. A torn final
+record is truncated; stale and identical writes do not grow the WAL.
 
-``` bash
-curl -i -X PUT http://localhost:5001/kv/name \
-  -H "Content-Type: text/plain" \
-  -d "Parimal"
-```
+**Quorums.** Writes persist locally, then fan out to every peer. The handler
+replies after W successes while remaining attempts finish on their own timeout.
+Reads collect R answers and prune dominated versions. W+R>N guarantees set
+overlap for acknowledged writes; it does not provide transactions or linearizability.
 
-A successful request returns an HTTP success status and the handler's
-success response.
+**Vector clocks.** The coordinator joins its local sibling clocks and increments
+its own counter. Replicas drop dominated versions and retain concurrent ones.
+Timestamps are informational. A plain PUT cannot convey client history that
+the coordinator has never seen, so sequential client writes can still conflict.
 
-### Get a value
+**Gossip.** Each process advances its own heartbeat and exchanges evidence with
+one random configured peer per round. Local monotonic time determines liveness;
+a process generation distinguishes restarts. Quorum code never consults gossip.
 
-``` bash
-curl -i http://localhost:5001/kv/name
-```
-
-The response body contains the stored value.
-
-### Missing key
-
-``` bash
-curl -i http://localhost:5001/kv/unknown
-```
-
-A key that is not present returns `404 Not Found`.
-
-### Example using two servers
-
-Write to Server A:
-
-``` bash
-curl -i -X PUT http://localhost:5001/kv/name \
-  -H "Content-Type: text/plain" \
-  -d "Parimal"
-```
-
-Read from Server A:
-
-``` bash
-curl http://localhost:5001/kv/name
-```
-
-Read from Server B:
-
-``` bash
-curl -i http://localhost:5002/kv/name
-```
-
-If the key has not been written to Server B, it should return
-`404 Not Found`. This illustrates that the instances are independent,
-not replicated.
-
-## Write-Ahead Log
-
-The WAL stores each mutation as a JSON record followed by a newline. For
-example:
-
-``` json
-{"op":"PUT","key":"name","value":"Parimal"}
-```
-
-The newline acts as a record delimiter. During startup, the store scans
-the WAL and replays supported records into the in-memory map.
-
-### Why write the WAL first?
-
-If the process stops after a successful WAL sync but before updating the
-in-memory map, the next startup can replay the record and restore the
-value. The WAL is therefore the persistence source used to rebuild
-in-memory state.
-
-### Startup recovery
-
-At startup, the implementation:
-
-1.  Opens the configured WAL file.
-2.  Removes an incomplete, unterminated tail fragment, if present.
-3.  Reads the WAL records.
-4.  Decodes supported records and replays `PUT` operations into the map.
-5.  Starts serving requests after recovery completes.
-
-For repeated writes to the same key, replaying records in order leaves
-the latest value in the map.
-
-### Incomplete tail recovery
-
-A process may stop while a record is being appended, leaving a final
-fragment without a newline. The current `recoverWALTail` helper
-truncates bytes after the last newline. This handles an incomplete final
-record, but it is not a general-purpose corruption repair mechanism.
-
-## Concurrency and failures
-
-### Mutex
-
-The store uses a `sync.Mutex` to serialize access to shared state and
-the WAL. This prevents concurrent goroutines from modifying the map or
-appending WAL records at the same time through the store methods.
-
-### Sync failures and ambiguous outcomes
-
-A successful `Write()` does not by itself prove that data has reached
-persistent storage. `Sync()` asks the operating system to flush file
-changes to stable storage, but it can return an error.
-
-If `Write()` succeeds and `Sync()` fails, the record might still be
-present after a restart---or it might not be. The client receives an
-error, but the final outcome can be uncertain. This is commonly called
-an **ambiguous commit**.
-
-The current implementation responds conservatively:
-
--   Marks the store unhealthy after a WAL write, short-write, or sync
-    error.
--   Rejects later `Put` and `Get` calls while unhealthy.
--   Requires a restart so the store can reconstruct state from the WAL.
-
-An error from `Sync()` should therefore not be interpreted as proof that
-the write was absent. Repeating a `PUT` of the same key and value is
-effectively idempotent for this simple API, but more complex operations
-may need unique request IDs or deduplication.
-
-### HTTP errors
-
-The handlers report errors to the client using HTTP error statuses.
-Check the handler implementation for the precise response body and
-status mapping in your current revision.
+**Anti-entropy.** Canonical hashes exclude timestamps and zero clock entries.
+Trees are immutable snapshots cached by store revision. Comparison descends
+only mismatching branches, validates bucket listings, then pulls/applies/pushes
+versions using the ordinary dominance rule. One worker serializes bounded
+cycles; gossip gates periodic selection and enqueues recovered peers.
 
 ## Testing
 
-Run the unit tests:
-
-``` bash
-go test ./...
+```bash
+scripts/verify-all.sh --quick
+scripts/verify-all.sh
+python3 scripts/chaos-cluster.py --seed 11 --duration 60
 ```
 
-Run tests with the Go race detector:
+Full mode includes cluster scripts, both negative controls, and three chaos
+seeds. Per-check logs are in `verify-logs/`; event histories, node logs and
+summaries are in `chaos-results/`. These generated artifacts are ignored by Git.
 
-``` bash
-go test -race ./...
-```
+The harness uses a **replayable fault schedule**, not deterministic execution.
+See [Testing](docs/TESTING.md) for invariants, failure controls and limitations,
+and [local results](docs/chaos-results.md) for measured seed outcomes.
 
-The current test suite covers:
+## Measurements
 
--   Basic put/get behavior.
--   Recovery from the WAL after creating a new store.
--   Concurrent access.
--   Recovery from an incomplete WAL tail.
--   Rejection of reads and writes when the store is marked unhealthy.
+[Loopback benchmark results](docs/BENCHMARKS.md) cover single-node and quorum
+latency, a paused-peer comparison, Merkle efficiency and restart catch-up.
+They record the hardware and methodology and are indicative, not production figures.
 
-The unhealthy-state test sets the failure flag directly. It verifies the
-store's fail-closed behavior, but does not simulate an actual
-operating-system disk write or sync failure.
+## Limits and further reading
 
-## Automated checkpoints
+- No deletes/tombstones, transactions, authentication, TLS, read repair or hinted handoff.
+- No automatic conflict resolution or client-supplied causal context.
+- Static membership and fixed tree shape; snapshots rebuild after changed revisions.
+- Loopback tests and SIGKILL do not simulate hardware failure or power loss.
+- A wiped node must catch up before reusing its old ID for new writes.
 
-The `checkpoint.sh` script performs practical integration checks using
-two temporary server instances and separate temporary WAL files.
+Details: [Design](docs/DESIGN.md), [Protocols](docs/PROTOCOLS.md),
+[Limitations](docs/LIMITATIONS.md), [Milestone diary](docs/MILESTONES.md).
 
-Run it from the project directory:
-
-``` bash
-chmod +x checkpoint.sh
-./checkpoint.sh
-```
-
-The script builds the server and checks that:
-
-1.  Two servers can start on separate ports.
-2.  Each server stores independent data.
-3.  A server can restart and recover its data from its WAL.
-4.  A server stops responding after receiving `SIGTERM`.
-5.  The other server remains operational independently.
-
-The script uses ports `5011` and `5012` and a temporary directory. It
-cleans up the temporary test files when it exits. Ensure those ports are
-available before running it.
-
-These integration checks complement, rather than replace, the unit tests
-and race-detector run. They do not test replication, real disk failures,
-power loss, or every possible shutdown race.
-
-## Limitations
-
-This is an educational single-node implementation. Current limitations
-include:
-
--   No replication between instances.
--   No leader election, consensus protocol, or distributed coordination.
--   No authentication, authorization, or TLS.
--   No compaction or WAL segment rotation; the WAL grows as writes
-    accumulate.
--   The simple tail-recovery approach reads the WAL into memory, which
-    is not suitable for arbitrarily large files.
--   It truncates an incomplete final fragment but does not robustly
-    repair malformed complete records or corruption in the middle of the
-    WAL.
--   No injected disk-failure testing.
--   No request-ID deduplication for operations with non-idempotent
-    effects.
--   No production-grade backup, metrics, or operational tooling.
-
-## Milestone 2 direction
-
-Milestone 2 can extend this foundation into a distributed KV store.
-Topics to design and implement incrementally include:
-
--   Node-to-node communication.
--   Replication of writes and data recovery across nodes.
--   Handling timeouts, unreachable nodes, and partial failures.
--   Choosing a coordination model, such as a leader-based design.
--   Defining consistency and acknowledgement guarantees.
--   Preventing duplicate application of retried requests.
-
-The current two-server checkpoint only proves that two independent
-processes can run at once. It does **not** establish distributed storage
-or replication.
-
-## Learning note
-
-The central Milestone 1 idea is the relationship between memory and
-durable storage:
-
--   The in-memory map makes ordinary reads fast.
--   The WAL records changes so state can be rebuilt after restart.
--   `Sync()` is used before acknowledging successful writes.
--   Recovery replays the log to reconstruct the map.
-
-Understanding these boundaries---especially what the system can and
-cannot promise when failures occur---is the foundation for the
-distributed milestone.
-=======
-
+Licensed under the [MIT License](LICENSE).

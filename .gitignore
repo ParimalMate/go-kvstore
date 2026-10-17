@@ -13,6 +13,9 @@ data/
 # macOS
 .DS_Store
 
+# Python script bytecode
+__pycache__/
+
 # IDE
 .vscode/
 .idea/
@@ -22,3 +25,16 @@ kvlog/server
 
 /server
 /kvlog
+
+# Verification artifacts
+chaos-results/
+verify-logs/
+
+# Local review handoffs
+/kvstore-*-review-*.zip
+/kvstore-final.zip
+/verify-all.txt
+/chaos-results-table.txt
+
+# Build output directory
+/bin/

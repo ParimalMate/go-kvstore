@@ -5,22 +5,39 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"kvstore/internal/vectorclock"
 	"os"
 	"sync"
+	"time"
+	"unicode/utf8"
 )
 
+// Entry is one sibling version. Ts is informational for clocked entries.
+type Entry struct {
+	Value string
+	VC    vectorclock.VectorClock
+	Ts    int64
+}
+
+var ErrClockCollision = errors.New("equal vector clocks carry different values")
+var ErrInvalidText = errors.New("keys and values must be valid UTF-8 text")
+
 type Store struct {
-	data   map[string]string
-	mu     sync.Mutex
-	log    *os.File
-	failed bool
+	data     map[string][]Entry
+	mu       sync.Mutex
+	log      *os.File
+	failed   bool
+	revision uint64
 }
 
 type record struct {
-	Op    string `json:"op"`
-	Key   string `json:"key"`
-	Value string `json:"value"`
+	Op    string                  `json:"op"`
+	Key   string                  `json:"key"`
+	Value string                  `json:"value"`
+	Ts    int64                   `json:"ts"`
+	VC    vectorclock.VectorClock `json:"vc"`
 }
 
 func NewStore(filePath string) *Store {
@@ -29,13 +46,21 @@ func NewStore(filePath string) *Store {
 		panic(err)
 	}
 
-	if err := recoverWALTail(file); err != nil {
+	ready := false
+	defer func() {
+		if !ready {
+			_ = file.Close()
+		}
+	}()
+	// Validate/replay complete records before any tail truncation. Rejected
+	// legacy or invalid clocked WALs must remain byte-for-byte unchanged.
+	contents, err := io.ReadAll(file)
+	if err != nil {
 		panic(err)
 	}
-
-	data := make(map[string]string)
-
-	scanner := bufio.NewScanner(file)
+	complete := contents[:bytes.LastIndexByte(contents, '\n')+1]
+	data := make(map[string][]Entry)
+	scanner := bufio.NewScanner(bytes.NewReader(complete))
 	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 
 	for scanner.Scan() {
@@ -45,35 +70,41 @@ func NewStore(filePath string) *Store {
 			continue
 		}
 
-		if rec.Op == "PUT" {
-			data[rec.Key] = rec.Value
+		if rec.Op != "PUT" {
+			continue
 		}
+		incoming := Entry{Value: rec.Value, VC: rec.VC, Ts: rec.Ts}
+		if rec.VC == nil {
+			panic(fmt.Errorf("WAL %q contains a PUT without a vector clock; Milestone 3 WALs require explicit migration; preserve this file and use a fresh --data path for Milestone 4", filePath))
+		}
+		if err := validateClock(rec.VC); err != nil {
+			panic(err)
+		}
+		next, _, err := resolveSiblings(data[rec.Key], incoming)
+		if err != nil {
+			panic(err)
+		}
+		data[rec.Key] = next
 	}
 
 	if err := scanner.Err(); err != nil {
 		panic(err)
 	}
 
+	if err := recoverWALTail(file); err != nil {
+		panic(err)
+	}
+	ready = true
 	return &Store{
 		log:  file,
 		data: data,
+		// A process-local snapshot version, initialized once after replay.
+		revision: 1,
 	}
 }
 
-func (s *Store) Put(key string, value string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.failed {
-		return errors.New("store is unhealthy, restart required")
-	}
-
-	rec := record{
-		Op:    "PUT",
-		Key:   key,
-		Value: value,
-	}
-
+// appendRecord requires s.mu to be held; memory changes only after durable append.
+func (s *Store) appendRecord(rec record) error {
 	encoded, err := json.Marshal(rec)
 	if err != nil {
 		return err
@@ -97,20 +128,156 @@ func (s *Store) Put(key string, value string) error {
 		return err
 	}
 
-	s.data[key] = value
 	return nil
 }
 
 func (s *Store) Get(key string) (string, bool, error) {
+	value, _, exists, err := s.GetWithMeta(key)
+	return value, exists, err
+}
+
+// GetWithMeta returns the value and its timestamp from the same stored entry.
+func (s *Store) GetWithMeta(key string) (string, int64, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.failed {
-		return "", false, errors.New("store is unhealthy, restart required")
+		return "", 0, false, errors.New("store is unhealthy, restart required")
 	}
 
-	value, exists := s.data[key]
-	return value, exists, nil
+	versions := s.data[key]
+	if len(versions) == 0 {
+		return "", 0, false, nil
+	}
+	if len(versions) > 1 {
+		return "", 0, false, errors.New("key has concurrent siblings; use GetSiblings")
+	}
+	return versions[0].Value, versions[0].Ts, true, nil
+}
+
+// PutWithClock stores a version according to causal dominance, never timestamp order.
+// The returned siblings and their clocks are independent copies.
+func (s *Store) PutWithClock(key, value string, vc vectorclock.VectorClock) ([]Entry, error) {
+	if !utf8.ValidString(key) || !utf8.ValidString(value) {
+		return nil, ErrInvalidText
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failed {
+		return nil, errors.New("store is unhealthy, restart required")
+	}
+	if err := validateClock(vc); err != nil {
+		return nil, err
+	}
+	// Copy the caller's map so later caller changes cannot alter stored history.
+	incoming := Entry{Value: value, VC: vectorclock.Merge(vc, nil), Ts: time.Now().UnixNano()}
+	next, changed, err := resolveSiblings(s.data[key], incoming)
+	if err != nil {
+		return nil, err
+	}
+	if !changed {
+		return cloneEntries(next), nil
+	}
+	rec := record{Op: "PUT", Key: key, Value: value, VC: incoming.VC, Ts: incoming.Ts}
+	if err := s.appendRecord(rec); err != nil {
+		return nil, err
+	}
+	s.data[key] = next
+	s.revision++
+	return cloneEntries(next), nil
+}
+
+// Revision identifies the current in-process state for snapshot caching. It is
+// initialized once after replay and is not a durable or cross-node version.
+func (s *Store) Revision() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.revision
+}
+
+// Range visits every key once in unspecified order while holding the store lock.
+// fn must be fast, must not call back into Store (that would deadlock), and must
+// not modify or retain the borrowed versions slice or its vector-clock maps.
+// Copy any data needed after fn returns. A scan cannot interleave with a write.
+func (s *Store) Range(fn func(key string, versions []Entry)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, versions := range s.data {
+		fn(key, versions)
+	}
+}
+
+// GetSiblings returns all versions; an absent key returns an empty slice.
+func (s *Store) GetSiblings(key string) ([]Entry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failed {
+		return nil, errors.New("store is unhealthy, restart required")
+	}
+	return cloneEntries(s.data[key]), nil
+}
+
+func validateClock(vc vectorclock.VectorClock) error {
+	for _, count := range vc {
+		if count < 0 {
+			return errors.New("vector clock counters must be nonnegative")
+		}
+	}
+	return nil
+}
+
+// resolveSiblings is the single dominance rule for live clocked writes and replay.
+// It never modifies the input slice or clocks and never performs file I/O.
+func resolveSiblings(current []Entry, incoming Entry) ([]Entry, bool, error) {
+	// First decide whether to reject the incoming version before dropping anything.
+	for _, sibling := range current {
+		relation := vectorclock.Compare(incoming.VC, sibling.VC)
+		if relation == vectorclock.Before {
+			return current, false, nil
+		}
+		if relation == vectorclock.Equal {
+			if incoming.Value != sibling.Value {
+				return nil, false, ErrClockCollision
+			}
+			return current, false, nil // Identical delivery; preserve first-stored timestamp.
+		}
+	}
+	next := make([]Entry, 0, len(current)+1)
+	for _, sibling := range current {
+		if vectorclock.Compare(incoming.VC, sibling.VC) != vectorclock.After {
+			next = append(next, sibling)
+		}
+	}
+	next = append(next, incoming)
+	return next, true, nil
+}
+
+// Reconcile applies the store's dominance rule to versions collected by a read.
+// It performs no persistence and returns independently owned entries.
+func Reconcile(versions []Entry) ([]Entry, error) {
+	result := make([]Entry, 0, len(versions))
+	for _, version := range versions {
+		if err := validateClock(version.VC); err != nil {
+			return nil, err
+		}
+		next, _, err := resolveSiblings(result, version)
+		if err != nil {
+			return nil, err
+		}
+		result = next
+	}
+	return cloneEntries(result), nil
+}
+
+func cloneEntries(entries []Entry) []Entry {
+	result := make([]Entry, len(entries))
+	for i, version := range entries {
+		result[i] = version
+		if version.VC != nil {
+			result[i].VC = vectorclock.Merge(version.VC, nil)
+		}
+	}
+	return result
 }
 
 func (s *Store) Close() error {
