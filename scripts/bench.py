@@ -12,6 +12,8 @@ import math
 import os
 import platform
 import statistics
+import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -27,16 +29,44 @@ def info(*cmd):
         return "unavailable"
 
 
+class BenchCluster(cl.Cluster):
+    """Direct peer connections: fault proxies are unnecessary for latency tests."""
+    def start(self):
+        reservations=[]
+        try:
+            for _ in range(self.n):
+                sock=socket.socket()
+                sock.bind(("127.0.0.1",0))
+                reservations.append(sock)
+            ports=[sock.getsockname()[1] for sock in reservations]
+            flags=["--w",str(self.w),"--r",str(self.r),"--gossip-interval","200ms",
+                   "--suspect-after","2s","--dead-after","4s"]
+            flags += ["--ae-interval","2s","--ae-initial-delay","1s"] if self.anti_entropy else ["--ae-interval","0"]
+            for i,port in enumerate(ports):
+                peers=[f"127.0.0.1:{p}" for j,p in enumerate(ports) if j!=i]
+                self.nodes.append(cl.Node(i,port,self.binary,self.workdir,self.logdir,peers,flags,dict(os.environ)))
+            for sock,node in zip(reservations,self.nodes):
+                sock.close()
+                node.start()
+        finally:
+            for sock in reservations:sock.close()
+
+
 @contextlib.contextmanager
 def cluster(n=3, w=2, r=2, ae=False):
     with tempfile.TemporaryDirectory(prefix="kvstore-bench-") as directory:
-        c = cl.Cluster(Path(directory)/"work", Path(directory)/"logs", n=n, w=w, r=r,
+        c = BenchCluster(Path(directory)/"work", Path(directory)/"logs", n=n, w=w, r=r,
                        anti_entropy=ae, race=False)
         try:
             c.build()
             c.start()
             assert c.wait_ready(), "gossip readiness failed"
             yield c
+        except BaseException:
+            destination=Path("verify-logs")/f"bench-failure-{time.time_ns()}"
+            if c.logdir.exists():shutil.copytree(c.logdir,destination)
+            print(f"Benchmark failure logs: {destination}",file=__import__('sys').stderr)
+            raise
         finally:
             c.shutdown()
 
@@ -117,7 +147,7 @@ def efficiency():
             # Outstanding replication failures must finish before restarting C.
             time.sleep(2.1)
             c.nodes[2].start()
-            peer=c.links[2,0].address
+            peer=f"127.0.0.1:{c.nodes[0].port}"
             code,body=cl.request(c.nodes[2].port,"POST","/internal/ae/run",json.dumps({"peer":peer}),timeout=65)
             assert code==200,(code,body)
             report=json.loads(body)[0]
@@ -151,9 +181,9 @@ def main():
     args=parser.parse_args()
     print("# Loopback benchmarks\n")
     print("Indicative educational measurements, not production capacity claims. "
-          "Sequential Python HTTP clients open a connection per request; peer traffic uses local "
-          "Python proxies. Server builds omit the race detector. Writes append and fsync the WAL; "
-          "latency includes client, proxy, OS and storage costs. No throughput extrapolation is made.\n")
+          "Sequential Python HTTP clients open a connection per request; peer traffic uses "
+          "direct HTTP connections, without fault proxies. Server builds omit the race detector. Writes append and fsync the WAL; "
+          "latency includes client, OS and storage costs. No throughput extrapolation is made.\n")
     print(f"- Date (UTC): {datetime.datetime.now(datetime.timezone.utc).isoformat()}")
     print(f"- OS: {platform.platform()}")
     print(f"- CPU: {info('sysctl','-n','machdep.cpu.brand_string')} ({os.cpu_count()} logical CPUs)")
