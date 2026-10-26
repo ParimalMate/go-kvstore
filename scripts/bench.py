@@ -2,7 +2,7 @@
 """Loopback benchmarks; normal builds, sequential clients, durable writes.
 
 python3 scripts/bench.py > docs/BENCHMARKS.md
-Use --only B3 for the quorum payoff (200 timed-out W=3 requests take ~400s).
+Use --only B3 for the quorum payoff (10 timed-out W=3 requests take ~20s).
 """
 import argparse
 import contextlib
@@ -20,6 +20,10 @@ import time
 from pathlib import Path
 
 import clusterlib as cl
+
+
+STRICT_PAUSED_REQUESTS = 10  # each waits the full deadline; see quorum()
+DEADLINE_MS = 2000.0  # the server's replication/quorum deadline
 
 
 def info(*cmd):
@@ -121,14 +125,27 @@ def basic(number,n,w,r):
 
 def quorum():
     print("\n## B3: quorum payoff with one paused peer\n",flush=True)
-    print("Latency includes failed requests; HTTP outcomes distinguish success from timeouts.\n",flush=True)
+    print("Latency includes failed requests. With W=3 and a paused peer every write waits out the "
+          "2s quorum deadline and returns 503, so only %d such writes are measured: a paused process keeps "
+          "accepting connections into its listen queue (gossip and replication add several per second), and "
+          "once that queue is full some operating systems refuse new connections immediately, which would "
+          "turn later requests into fast failures that say nothing about quorum behaviour.\n" % STRICT_PAUSED_REQUESTS,flush=True)
     latency_header()
     for w,r in [(2,2),(3,1)]:
         with cluster(w=w,r=r) as c:
             latency_row(f"W={w}, R={r}, healthy",measure(c,200,"PUT","healthy"))
             c.nodes[2].pause()
             try:
-                latency_row(f"W={w}, R={r}, n3 paused",measure(c,200,"PUT","paused",True))
+                count = STRICT_PAUSED_REQUESTS if w == 3 else 200
+                result = measure(c,count,"PUT","paused",True)
+                latency_row(f"W={w}, R={r}, n3 paused",result)
+                if w == 3:
+                    fast = sum(1 for d in result[0] if d < DEADLINE_MS - 100)
+                    waited = len(result[0]) - fast
+                    print(f"\nW=3 writes that waited out the full {DEADLINE_MS:.0f} ms quorum deadline: {waited} of {len(result[0])}.",flush=True)
+                    if fast:
+                        print(f"WARNING: {fast} request(s) failed fast, which is not quorum behaviour; "
+                              "do not publish this row.",flush=True)
             finally:
                 c.nodes[2].resume()
 

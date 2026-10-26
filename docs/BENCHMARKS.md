@@ -27,14 +27,19 @@ Indicative educational measurements, not production capacity claims. Sequential 
 
 ## B3: quorum payoff with one paused peer
 
-Latency includes failed requests; HTTP outcomes distinguish success from timeouts.
+Remeasured on 2026-10-26 with the corrected ten-request paused W=3 sample.
+Other benchmark sections retain their original measurements.
+
+Latency includes failed requests. With W=3 and a paused peer every write waits out the 2s quorum deadline and returns 503, so only 10 such writes are measured: a paused process keeps accepting connections into its listen queue (gossip and replication add several per second), and once that queue is full some operating systems refuse new connections immediately, which would turn later requests into fast failures that say nothing about quorum behaviour.
 
 | Case | Requests | p50 ms | p95 ms | p99 ms | HTTP outcomes |
 |---|---:|---:|---:|---:|---|
-| W=2, R=2, healthy | 200 | 10.839 | 15.042 | 18.247 | 200: 200 |
-| W=2, R=2, n3 paused | 200 | 7.972 | 8.877 | 13.810 | 200: 200 |
-| W=3, R=1, healthy | 200 | 11.786 | 13.135 | 17.097 | 200: 200 |
-| W=3, R=1, n3 paused | 200 | 7.975 | 2005.618 | 2007.242 | 503: 200 |
+| W=2, R=2, healthy | 200 | 9.848 | 12.209 | 15.175 | 200: 200 |
+| W=2, R=2, n3 paused | 200 | 8.023 | 9.279 | 10.706 | 200: 200 |
+| W=3, R=1, healthy | 200 | 10.875 | 12.917 | 13.502 | 200: 200 |
+| W=3, R=1, n3 paused | 10 | 2006.179 | 2008.158 | 2008.158 | 503: 10 |
+
+W=3 writes that waited out the full 2000 ms quorum deadline: 10 of 10.
 
 ## B4: Merkle comparison after 10,000 shared keys
 

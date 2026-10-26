@@ -42,7 +42,7 @@ For example, a conflict can return:
 The caller chooses or combines application values. Sending a new PUT to a
 coordinator that knows both histories supersedes both. A coordinator that
 knows only one may create another concurrent version; see the concrete
-examples under [known limitations](#known-limitation-the-coordinator-knows-only-local-history).
+examples under [known limitations](DESIGN.md#known-limitation-the-coordinator-knows-only-local-history).
 
 Peer-facing endpoints use the same key path under `/internal/kv/{key}`.
 Internal PUT accepts `{value, vc}`; internal GET returns the full sibling
