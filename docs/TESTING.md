@@ -106,3 +106,9 @@ Control logs are in `verify-logs/chaos-control-no-repair.log` and
 The two additional 180-second runs (seeds 11 and 12) also completed with zero
 violations and identical restart replay. Performance measurements are recorded
 separately in [Benchmarks](BENCHMARKS.md); no chaos workload ran during them.
+
+On 2026-11-22 both matrices were rerun on the release code (commit `57b60a4`,
+server code identical to v1.0.1): all twelve seeds again reported zero
+violations and identical restart replay, with the same fault counts per seed.
+The published tables are from that rerun; its summaries are kept in
+`chaos-results/matrix-60s-v1.0.1/` and `chaos-results/extended-v1.0.1/`.
