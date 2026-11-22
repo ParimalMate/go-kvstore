@@ -1,6 +1,7 @@
 # Distributed Key-Value Store in Go
 
 [![CI](https://github.com/ParimalMate/go-kvstore/actions/workflows/ci.yml/badge.svg)](https://github.com/ParimalMate/go-kvstore/actions/workflows/ci.yml)
+[![Cluster checks](https://github.com/ParimalMate/go-kvstore/actions/workflows/cluster-checks.yml/badge.svg)](https://github.com/ParimalMate/go-kvstore/actions/workflows/cluster-checks.yml)
 
 An educational Dynamo-style replicated key-value store with a durable write-ahead
 log, configurable quorums, vector-clock conflict detection, gossip failure
@@ -180,6 +181,10 @@ python3 scripts/chaos-cluster.py --seed 11 --duration 60
 Full mode includes cluster scripts, both negative controls, and three chaos
 seeds. Per-check logs are in `verify-logs/`; event histories, node logs and
 summaries are in `chaos-results/`. These generated artifacts are ignored by Git.
+CI runs the build, vet, formatting and race-enabled Go tests on every push; the
+full verifier runs on GitHub Actions through the manually triggered
+[Cluster checks](.github/workflows/cluster-checks.yml) workflow, which uploads
+its logs.
 
 The harness uses a **replayable fault schedule**, not deterministic execution.
 See [Testing](docs/TESTING.md) for invariants, failure controls and limitations,
@@ -195,6 +200,8 @@ They record the hardware and methodology and are indicative, not production figu
 
 - No deletes/tombstones, transactions, authentication, TLS, read repair or hinted handoff.
 - No automatic conflict resolution or client-supplied causal context.
+- Every node stores every key: no consistent-hashing ring or partitioning, so
+  adding nodes adds copies, not capacity.
 - Static membership and fixed tree shape; snapshots rebuild after changed revisions.
 - Loopback tests and SIGKILL do not simulate hardware failure or power loss.
 - A wiped node must catch up before reusing its old ID for new writes.

@@ -6,6 +6,9 @@
   if the second coordinator has not learned the first write.
 - No read repair or hinted handoff. Background anti-entropy repairs missed
   versions; convergence still depends on reachable peers and completed cycles.
+- Full replication: every node stores every key and each write fans out to
+  all configured peers. There is no consistent-hashing ring, key partitioning
+  or preference list, so adding nodes adds copies rather than capacity.
 - Static peer addresses: gossip learns IDs but does not discover new dialable
   addresses or change quorum membership. Liveness gates automatic repair selection but never quorum operations.
 - Gossip thresholds assume a small cluster and sufficient network/scheduling
