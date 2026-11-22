@@ -699,5 +699,5 @@ a recovery hook completing a cycle within 500ms, and cancellation of an
 in-flight cycle with repeated Stop calls within one second.
 
 The `milestone-6` tag records this implemented and tested checkpoint.
-Independent review of the worker, cycles and endpoints is complete. Manual
+A review pass over the worker, cycles and endpoints is complete. Manual
 repair requests now reject addresses outside configured `--peers` with HTTP 400.

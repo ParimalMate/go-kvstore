@@ -57,7 +57,7 @@ comes from the harness's own `summary.json` files.
 A test that cannot fail proves nothing, so the harness is checked from three directions.
 
 1. **The checker is tested on fake histories.** `scripts/test_chaos_invariants.py` has 21 cases, one or
-   more per rule. In the supplied independent review, breaking the checker in ten different ways (never flag a lost write, drop the
+   more per rule. In a mutation check of the checker, breaking it in ten different ways (never flag a lost write, drop the
    indeterminate allowance, off-by-one on the floor, allow a 404 after an ack, stop normalizing zero
    clock entries, ignore GET 502, accept prefix-only value matches, count an ack that ended exactly at
    read start, skip the cross-node check, forget PUT 500) was caught by the tests every time.
@@ -76,7 +76,7 @@ A test that cannot fail proves nothing, so the harness is checked from three dir
      holds the missing data pushes it from its own cycle, so the same divergence is still repaired. The
      harness checks outcomes, not mechanisms, and this is an equivalent mutant.
 
-## Bugs found in the supplied harness review
+## Bugs found while reviewing the harness
 
 - The crash monitor reported a deliberate graceful stop as a crash: it read a node's state before its
   exit status, so a stop that began between the two reads looked like an unexpected exit. The state is now
@@ -94,8 +94,8 @@ A test that cannot fail proves nothing, so the harness is checked from three dir
 
 ## Local verification record
 
-On 2026-10-17, the supplied harness was installed with the large-payload test
-fix. `scripts/verify-all.sh --quick` passed; the full verifier then passed all
+On 2026-10-17, after the large-payload test fix was applied,
+`scripts/verify-all.sh --quick` passed; the full verifier then passed all
 Go/Python checks, four cluster scripts, both negative controls and seeds 1–3
 at 45 seconds each, ending with `ALL CHECKS PASSED` (no skips).
 The 60-second matrix was run separately and its original summaries were kept

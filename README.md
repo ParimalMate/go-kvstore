@@ -7,7 +7,7 @@ log, configurable quorums, vector-clock conflict detection, gossip failure
 detection, and Merkle-tree anti-entropy. It preserves concurrent values instead
 of silently selecting a winner and repairs replicas that missed writes.
 
-Milestones 1–6 are implemented and independently reviewed. The Milestone 7
+Milestones 1–6 are implemented and tested. The Milestone 7
 fault-injection harness and its local results are described in
 [Testing](docs/TESTING.md) and the [seed matrix](docs/chaos-results.md).
 This is a learning project, not a production database.
